@@ -398,6 +398,107 @@ def _set_hwmon_fan_auto(pwm_path: str):
     subprocess.run(["sudo", "tee", pwm_path + "_enable"], input=b"2", capture_output=True, timeout=3)
 
 
+# ── Memory / DIMM sensors ────────────────────────────────────────────────────
+def _dimm_temps() -> list:
+    """Return [(label, temp_c)] for spd5118 DIMM sensors."""
+    result = []
+    slot = 1
+    for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        try:
+            if (hwmon / "name").read_text().strip() != "spd5118":
+                continue
+            t = int((hwmon / "temp1_input").read_text().strip()) / 1000
+            result.append((f"DIMM {slot}", t))
+            slot += 1
+        except: pass
+    return result
+
+
+# ── Storage sensors ───────────────────────────────────────────────────────────
+def _phys_dev(dev_path: str) -> str:
+    """'/dev/nvme0n1p2' → 'nvme0n1',  '/dev/sda3' → 'sda'."""
+    name = Path(dev_path).name
+    if "nvme" in name:
+        idx = name.rfind("p")
+        if idx > 0 and name[idx + 1:].isdigit():
+            return name[:idx]
+        return name
+    return name.rstrip("0123456789")
+
+def _nvme_info() -> dict:
+    """Returns {nvme_name: {model, temp}} for each NVMe hwmon device."""
+    result = {}
+    for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        try:
+            if (hwmon / "name").read_text().strip() != "nvme":
+                continue
+            dev = (hwmon / "device").resolve()
+            nvme_name = dev.name   # e.g. "nvme0"
+            model = ""
+            for mp in (dev / "model", Path(f"/sys/class/nvme/{nvme_name}/model")):
+                if mp.exists():
+                    model = mp.read_text().strip(); break
+            temp = int((hwmon / "temp1_input").read_text().strip()) / 1000
+            result[nvme_name] = {"model": model, "temp": temp}
+        except: pass
+    return result
+
+_io_prev: dict = {}   # dev → (read_bytes, write_bytes, timestamp)
+
+def _disk_rates() -> dict:
+    """Returns {dev: (read_MB_s, write_MB_s)} delta since last call."""
+    global _io_prev
+    now = time.time()
+    rates = {}
+    try:
+        counters = psutil.disk_io_counters(perdisk=True) or {}
+        for dev, c in counters.items():
+            if dev in _io_prev:
+                pr, pw, pt = _io_prev[dev]
+                dt = now - pt
+                if dt > 0:
+                    rates[dev] = ((c.read_bytes - pr) / dt / 1024**2,
+                                  (c.write_bytes - pw) / dt / 1024**2)
+            _io_prev[dev] = (c.read_bytes, c.write_bytes, now)
+    except: pass
+    return rates
+
+def _disk_info() -> list:
+    """Returns list of {phys_dev, model, temp, mounts:[{mountpoint,used_gb,total_gb,pct,fstype}]}."""
+    nvme = _nvme_info()
+    groups: dict = {}
+    for part in psutil.disk_partitions(all=False):
+        try:
+            if not part.mountpoint or part.fstype in ("tmpfs","devtmpfs","squashfs",""):
+                continue
+            usage = psutil.disk_usage(part.mountpoint)
+            phys  = _phys_dev(part.device)
+            if phys not in groups:
+                # Try to get model for non-NVMe drives
+                model = ""
+                for mp in (Path(f"/sys/block/{phys}/device/model"),):
+                    if mp.exists():
+                        model = mp.read_text().strip(); break
+                # NVMe: map nvme0n1 → nvme0
+                import re as _re
+                nvme_key = ""
+                if "nvme" in phys:
+                    m = _re.match(r"(nvme\d+)", phys)
+                    if m: nvme_key = m.group(1)
+                ni = nvme.get(nvme_key, {})
+                groups[phys] = {"phys_dev": phys, "model": ni.get("model", model),
+                                "temp": ni.get("temp", 0), "mounts": []}
+            groups[phys]["mounts"].append({
+                "mountpoint": part.mountpoint,
+                "used_gb":  usage.used  / 1024**3,
+                "total_gb": usage.total / 1024**3,
+                "pct":      usage.percent,
+                "fstype":   part.fstype,
+            })
+        except: pass
+    return list(groups.values())
+
+
 # ── GPU profile persistence ───────────────────────────────────────────────────
 _PROF_DIR  = Path.home() / ".config" / "thermalwatch"
 _PROF_FILE = _PROF_DIR / "gpu_profiles.json"
@@ -442,15 +543,26 @@ class Collector(QThread):
     tick = pyqtSignal(dict)
     def run(self):
         psutil.cpu_percent(interval=None)
+        psutil.cpu_percent(percpu=True, interval=None)
         while not self.isInterruptionRequested():
             try:
+                core_freqs = []
+                try:
+                    cf = psutil.cpu_freq(percpu=True)
+                    core_freqs = [f.current for f in cf] if cf else []
+                except: pass
                 self.tick.emit({
-                    "cpu_t":   _cpu_temp(),
-                    "gpu_t":   _gpu_temp(),
-                    "cpu_pct": psutil.cpu_percent(interval=None),
-                    "cpu_mhz": (psutil.cpu_freq().current if psutil.cpu_freq() else 0),
-                    "gov":     _cpu_governor(),
-                    "gpu":     _gpu_info(),
+                    "cpu_t":        _cpu_temp(),
+                    "gpu_t":        _gpu_temp(),
+                    "cpu_pct":      psutil.cpu_percent(interval=None),
+                    "cpu_mhz":      (psutil.cpu_freq().current if psutil.cpu_freq() else 0),
+                    "gov":          _cpu_governor(),
+                    "gpu":          _gpu_info(),
+                    "cpu_cores":    psutil.cpu_percent(percpu=True, interval=None),
+                    "cpu_core_mhz": core_freqs,
+                    "ram":          psutil.virtual_memory(),
+                    "swap":         psutil.swap_memory(),
+                    "dimm_temps":   _dimm_temps(),
                 })
             except: pass
             time.sleep(1)
@@ -1016,6 +1128,76 @@ class ProfileBar(QWidget):
 # TABS
 # ═════════════════════════════════════════════════════════════════════════════
 
+class CoreGrid(QWidget):
+    """Painted heatmap of per-CPU-core load (and frequency if available)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cores: list = []   # [(pct, mhz), ...]
+        self.setSizePolicy(_SP.Expanding, _SP.Preferred)
+        self.setMinimumHeight(72)
+
+    def update_cores(self, pcts: list, freqs: list):
+        n = len(pcts)
+        self._cores = [(pcts[i], freqs[i] if i < len(freqs) else 0) for i in range(n)]
+        cols = min(8, max(4, math.ceil(math.sqrt(n * 2))))
+        rows = math.ceil(n / cols)
+        self.setMinimumHeight(max(72, rows * 42 + 6))
+        self.update()
+
+    def paintEvent(self, _):
+        if not self._cores: return
+        p = QPainter(self); p.setRenderHint(_RH.Antialiasing)
+        n = len(self._cores)
+        cols = min(8, max(4, math.ceil(math.sqrt(n * 2))))
+        rows = math.ceil(n / cols)
+        GAP = 4
+        w, h = self.width(), self.height()
+        cw = max(24.0, (w - GAP * (cols + 1)) / cols)
+        ch = max(24.0, (h - GAP * (rows + 1)) / rows)
+
+        for i, (pct, mhz) in enumerate(self._cores):
+            col = i % cols; row = i // cols
+            x = GAP + col * (cw + GAP)
+            y = GAP + row * (ch + GAP)
+            t = _clamp(pct / 100.0, 0.0, 1.0)
+            # Colour: teal(0%) → orange(50%) → red(100%)
+            if t < 0.5:
+                t2 = t * 2
+                r = int(C_GPU.red()   + (C_WARN.red()   - C_GPU.red())   * t2)
+                g = int(C_GPU.green() + (C_WARN.green() - C_GPU.green()) * t2)
+                b = int(C_GPU.blue()  + (C_WARN.blue()  - C_GPU.blue())  * t2)
+            else:
+                t2 = (t - 0.5) * 2
+                r = int(C_WARN.red()   + (C_CRIT.red()   - C_WARN.red())   * t2)
+                g = int(C_WARN.green() + (C_CRIT.green() - C_WARN.green()) * t2)
+                b = int(C_WARN.blue()  + (C_CRIT.blue()  - C_WARN.blue())  * t2)
+            accent = QColor(r, g, b)
+            bg = QColor(r, g, b, max(18, int(t * 110)))
+            p.setPen(_PS.NoPen); p.setBrush(QBrush(bg))
+            p.drawRoundedRect(int(x), int(y), int(cw), int(ch), 5, 5)
+            border_c = QColor(r, g, b, 80)
+            p.setPen(QPen(border_c, 1)); p.setBrush(_BS.NoBrush)
+            p.drawRoundedRect(int(x), int(y), int(cw), int(ch), 5, 5)
+            # Core index (small, top-left)
+            p.setFont(QFont("", max(6, int(ch * 0.20)))); p.setPen(QPen(C_MUTED))
+            p.drawText(int(x + 3), int(y + ch * 0.30), f"C{i}")
+            # Usage % (centre)
+            p.setFont(QFont("", max(7, int(ch * 0.32)), _bold()))
+            p.setPen(QPen(accent))
+            txt = f"{pct:.0f}%"
+            fm  = QFontMetrics(p.font())
+            p.drawText(int(x + (cw - fm.horizontalAdvance(txt)) / 2),
+                       int(y + ch * 0.70), txt)
+            # Frequency (bottom, only if cell is tall enough)
+            if ch >= 46 and mhz > 0:
+                p.setFont(QFont("", max(6, int(ch * 0.19)))); p.setPen(QPen(C_MUTED))
+                f_txt = f"{mhz / 1000:.1f}G"
+                fm2   = QFontMetrics(p.font())
+                p.drawText(int(x + (cw - fm2.horizontalAdvance(f_txt)) / 2),
+                           int(y + ch - 4), f_txt)
+        p.end()
+
+
 class OverviewTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent); self._build()
@@ -1043,7 +1225,8 @@ class OverviewTab(QWidget):
         self._cpu_spark = Sparkline("CPU temperature history", C_CPU)
         self._cpu_freq  = InfoRow("Core Frequency")
         self._cpu_gov   = InfoRow("Governor")
-        for w in (lb, self._cpu_gauge, self._cpu_bar, self._cpu_pct, self._cpu_spark, self._cpu_freq, self._cpu_gov): cl.addWidget(w)
+        for w in (lb, self._cpu_gauge, self._cpu_bar, self._cpu_pct,
+                  self._cpu_spark, self._cpu_freq, self._cpu_gov): cl.addWidget(w)
 
         gpu_f, gl = _card()
         lb2 = QLabel("GRAPHICS"); lb2.setFont(QFont("", 9, _bold())); lb2.setStyleSheet(f"color:{C_MUTED.name()};letter-spacing:2px;")
@@ -1063,6 +1246,24 @@ class OverviewTab(QWidget):
         row.addWidget(cpu_f); row.addWidget(gpu_f)
         lay.addLayout(row, 1)
 
+        # ── RAM + DIMM row ────────────────────────────────────────────────────
+        ram_row = QHBoxLayout(); ram_row.setSpacing(16)
+
+        ram_f, rl = _card()
+        ram_f.setSizePolicy(_SP.Expanding, _SP.Preferred)
+        lb_r = QLabel("MEMORY"); lb_r.setFont(QFont("", 9, _bold()))
+        lb_r.setStyleSheet(f"color:{C_MUTED.name()};letter-spacing:2px;")
+        self._ram_bar  = UsageBar(C_CPU)
+        self._ram_info = InfoRow("RAM Used")
+        self._ram_avail= InfoRow("Available")
+        self._swap_row = InfoRow("Swap")
+        for w in (lb_r, self._ram_bar, self._ram_info, self._ram_avail, self._swap_row):
+            rl.addWidget(w)
+        # DIMM temp rows (added dynamically on first tick)
+        self._dimm_rows: list = []
+        ram_row.addWidget(ram_f)
+        lay.addLayout(ram_row)
+
     def on_tick(self, d: dict):
         self._clock.setText(datetime.now().strftime("%a %d %b  %H:%M:%S"))
         ct, gt, cu = d["cpu_t"], d["gpu_t"], d["cpu_pct"]
@@ -1081,6 +1282,24 @@ class OverviewTab(QWidget):
         self._gpu_power.set(f"{gi['power']:.1f} W")
         self._gpu_fan.set(f"{gi['fan']}%" if gi['fan'] else "N/A")
         self._gpu_clock.set(f"{gi['clock']} / {gi['mem_clock']} MHz" if gi['clock'] else "N/A")
+        # RAM
+        vm = d.get("ram"); sm = d.get("swap")
+        if vm:
+            self._ram_bar.set(vm.percent)
+            self._ram_info.set(f"{vm.used/1024**3:.1f} / {vm.total/1024**3:.1f} GB  ({vm.percent:.0f}%)")
+            self._ram_avail.set(f"{vm.available/1024**3:.1f} GB free")
+        if sm:
+            self._swap_row.set(
+                f"{sm.used/1024**3:.1f} / {sm.total/1024**3:.1f} GB" if sm.total else "Not configured")
+        # DIMM temps — create rows on first appearance
+        dimms = d.get("dimm_temps", [])
+        if dimms and not self._dimm_rows:
+            for label, _ in dimms:
+                row = InfoRow(label)
+                self._dimm_rows.append(row)
+                self._ram_bar.parent().layout().addWidget(row)  # add to ram card layout
+        for row, (_, temp) in zip(self._dimm_rows, dimms):
+            row.set(f"{temp:.1f} °C")
 
 
 class GPUTuningTab(QWidget):
@@ -1736,6 +1955,185 @@ class FanCard(QWidget):
         self._spark.push(value)
 
 
+# ── CPU Tab (per-core heatmap) ────────────────────────────────────────────────
+
+class CpuTab(QWidget):
+    """Per-core load heatmap + frequency details."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self); outer.setContentsMargins(18, 18, 18, 18); outer.setSpacing(14)
+
+        title = QLabel("CPU Cores")
+        title.setStyleSheet(f"color:{C_TEXT.name()};font-size:15px;font-weight:bold;")
+        outer.addWidget(title)
+
+        card_w = QWidget()
+        card_w.setStyleSheet(f"background:{C_CARD.name()};border-radius:10px;")
+        cl = QVBoxLayout(card_w); cl.setContentsMargins(14, 12, 14, 12); cl.setSpacing(8)
+
+        sec = QLabel("PER-CORE LOAD"); sec.setFont(QFont("", 9, _bold()))
+        sec.setStyleSheet(f"color:{C_MUTED.name()};letter-spacing:2px;")
+        cl.addWidget(sec)
+
+        self._core_grid = CoreGrid()
+        cl.addWidget(self._core_grid)
+
+        outer.addWidget(card_w)
+
+        # summary row below the heatmap
+        stats_w = QWidget()
+        stats_w.setStyleSheet(f"background:{C_CARD.name()};border-radius:10px;")
+        sl = QVBoxLayout(stats_w); sl.setContentsMargins(14, 10, 14, 10); sl.setSpacing(4)
+        sec2 = QLabel("SUMMARY"); sec2.setFont(QFont("", 9, _bold()))
+        sec2.setStyleSheet(f"color:{C_MUTED.name()};letter-spacing:2px;")
+        self._total_pct  = InfoRow("Total CPU Load")
+        self._avg_freq   = InfoRow("Average Frequency")
+        self._min_max    = InfoRow("Min / Max Core Load")
+        for w in (sec2, self._total_pct, self._avg_freq, self._min_max):
+            sl.addWidget(w)
+        outer.addWidget(stats_w)
+        outer.addStretch()
+
+    def on_tick(self, d: dict):
+        cores = d.get("cpu_cores", [])
+        freqs = d.get("cpu_core_mhz", [])
+        if not cores:
+            return
+        self._core_grid.update_cores(cores, freqs)
+        self._total_pct.set(f"{d.get('cpu_pct', 0):.1f}%")
+        if freqs:
+            avg_f = sum(freqs) / len(freqs)
+            self._avg_freq.set(f"{avg_f:.0f} MHz")
+        if cores:
+            self._min_max.set(f"{min(cores):.0f}% / {max(cores):.0f}%")
+
+
+# ── Storage Tab ───────────────────────────────────────────────────────────────
+
+class _DiskCard(QWidget):
+    """One card per physical disk: model name, NVMe temp, partitions + throughput."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setStyleSheet(f"background:{C_CARD.name()};border-radius:10px;")
+        lay = QVBoxLayout(self); lay.setContentsMargins(14, 12, 14, 12); lay.setSpacing(6)
+
+        hdr = QHBoxLayout()
+        self._name_lbl = QLabel("—"); self._name_lbl.setStyleSheet(
+            f"color:{C_TEXT.name()};font-size:13px;font-weight:bold;")
+        self._temp_lbl = QLabel(""); self._temp_lbl.setStyleSheet(
+            f"color:{C_GPU.name()};font-size:12px;")
+        hdr.addWidget(self._name_lbl); hdr.addStretch(); hdr.addWidget(self._temp_lbl)
+        lay.addLayout(hdr)
+
+        # throughput row
+        io_row = QHBoxLayout()
+        self._read_lbl  = QLabel("R: — MB/s"); self._read_lbl.setStyleSheet(
+            f"color:{C_CPU.name()};font-size:11px;")
+        self._write_lbl = QLabel("W: — MB/s"); self._write_lbl.setStyleSheet(
+            f"color:{C_OC.name()};font-size:11px;")
+        self._read_spark  = Sparkline("R", C_CPU, max_val=500)
+        self._write_spark = Sparkline("W", C_OC,  max_val=500)
+        self._read_spark.setFixedSize(100, 28)
+        self._write_spark.setFixedSize(100, 28)
+        io_row.addWidget(self._read_lbl); io_row.addWidget(self._read_spark)
+        io_row.addSpacing(12)
+        io_row.addWidget(self._write_lbl); io_row.addWidget(self._write_spark)
+        io_row.addStretch()
+        lay.addLayout(io_row)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color:{C_BORDER.name()};")
+        lay.addWidget(sep)
+
+        self._part_lay = QVBoxLayout(); self._part_lay.setSpacing(4)
+        lay.addLayout(self._part_lay)
+        self._part_widgets: list = []
+
+    def update_data(self, info: dict, rates: tuple):
+        model = info.get("model", info.get("phys_dev", "Unknown"))
+        self._name_lbl.setText(model[:50])
+        temp = info.get("temp")
+        if temp is not None:
+            c = _temp_color(temp)
+            self._temp_lbl.setText(f"{temp:.0f} °C")
+            self._temp_lbl.setStyleSheet(f"color:{c.name()};font-size:12px;")
+        else:
+            self._temp_lbl.setText("")
+
+        r_mbs, w_mbs = rates
+        self._read_lbl.setText(f"R: {r_mbs:.1f} MB/s")
+        self._write_lbl.setText(f"W: {w_mbs:.1f} MB/s")
+        self._read_spark.push(int(r_mbs))
+        self._write_spark.push(int(w_mbs))
+
+        mounts = info.get("mounts", [])
+        # grow partition widgets as needed
+        while len(self._part_widgets) < len(mounts):
+            pw = QWidget()
+            pl = QVBoxLayout(pw); pl.setContentsMargins(0, 2, 0, 2); pl.setSpacing(2)
+            mp_lbl = QLabel(); mp_lbl.setStyleSheet(
+                f"color:{C_MUTED.name()};font-size:10px;")
+            bar = UsageBar(C_CPU)
+            bar.setFixedHeight(8)
+            info_lbl = QLabel(); info_lbl.setStyleSheet(
+                f"color:{C_TEXT.name()};font-size:10px;")
+            pl.addWidget(mp_lbl); pl.addWidget(bar); pl.addWidget(info_lbl)
+            self._part_lay.addWidget(pw)
+            self._part_widgets.append((mp_lbl, bar, info_lbl))
+
+        for i, m in enumerate(mounts):
+            mp_lbl, bar, info_lbl = self._part_widgets[i]
+            mp_lbl.setText(f"{m['mountpoint']}  [{m['fstype']}]")
+            bar.set(m["pct"])
+            info_lbl.setText(
+                f"{m['used_gb']:.1f} / {m['total_gb']:.1f} GB  ({m['pct']:.0f}%)")
+
+
+class StorageTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cards: dict = {}   # phys_dev → _DiskCard
+        outer = QVBoxLayout(self); outer.setContentsMargins(18, 18, 18, 18)
+
+        title = QLabel("Storage")
+        title.setStyleSheet(f"color:{C_TEXT.name()};font-size:15px;font-weight:bold;")
+        outer.addWidget(title)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        self._card_lay = QVBoxLayout(inner)
+        self._card_lay.setSpacing(14)
+        self._card_lay.addStretch()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        # own 2-second timer to poll disk rates
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(2000)
+        self._refresh()   # populate immediately
+
+    def _refresh(self):
+        try:
+            disks = _disk_info()
+            rates_map = _disk_rates()
+        except Exception:
+            return
+
+        for info in disks:
+            dev = info["phys_dev"]
+            if dev not in self._cards:
+                card = _DiskCard()
+                self._cards[dev] = card
+                # insert before the stretch at the end
+                idx = self._card_lay.count() - 1
+                self._card_lay.insertWidget(idx, card)
+
+            r, w = rates_map.get(dev, (0.0, 0.0))
+            self._cards[dev].update_data(info, (r, w))
+
+
 class FansTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1954,11 +2352,15 @@ class MainWindow(QMainWindow):
             QTabBar::tab:hover:!selected {{color:{C_TEXT.name()};}}
         """)
         self._overview_tab   = OverviewTab()
+        self._cpu_tab        = CpuTab()
         self._gpu_tuning_tab = GPUTuningTab()
+        self._storage_tab    = StorageTab()
         self._fans_tab       = FansTab()
         self._task_mgr_tab   = TaskManagerTab()
         tabs.addTab(self._overview_tab,   "Overview")
+        tabs.addTab(self._cpu_tab,        "CPU")
         tabs.addTab(self._gpu_tuning_tab, "GPU Tuning")
+        tabs.addTab(self._storage_tab,    "Storage")
         tabs.addTab(self._fans_tab,       "Fans")
         tabs.addTab(self._task_mgr_tab,   "Processes")
         root.addWidget(tabs, 1)
@@ -2047,6 +2449,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot(dict)
     def _on_tick(self, d: dict):
         self._overview_tab.on_tick(d)
+        self._cpu_tab.on_tick(d)
         self._gpu_tuning_tab.on_tick(d)
         self._fans_tab.on_tick(d)
         self._gov_row.set(d["gov"])
