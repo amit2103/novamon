@@ -334,6 +334,70 @@ def _set_fan_manual(pct: int):
 def _set_fan_auto():
     _nvset("[gpu:0]/GPUFanControlState", 0)
 
+# ── System fan discovery and control ─────────────────────────────────────────
+def _discover_fans() -> list:
+    """Return list of fan dicts from hwmon + NVIDIA NVML."""
+    fans = []
+    for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+        try:    chip = (hwmon / "name").read_text().strip()
+        except: chip = hwmon.name
+        for fan_input in sorted(hwmon.glob("fan*_input")):
+            num   = "".join(c for c in fan_input.stem if c.isdigit())
+            lf    = hwmon / f"fan{num}_label"
+            label = lf.read_text().strip() if lf.exists() else f"Fan {num}"
+            pwm_f = hwmon / f"pwm{num}"
+            fans.append({
+                "id":          f"{hwmon.name}_fan{num}",
+                "chip":        chip,
+                "label":       label,
+                "type":        "hwmon",
+                "rpm_path":    str(fan_input),
+                "pwm_path":    str(pwm_f) if pwm_f.exists() else None,
+                "can_control": pwm_f.exists(),
+            })
+    if NVIDIA and _nvh:
+        try:    n_fans = pynvml.nvmlDeviceGetNumFans(_nvh)
+        except: n_fans = 1
+        try:
+            raw  = pynvml.nvmlDeviceGetName(_nvh)
+            gname = raw.decode() if isinstance(raw, bytes) else raw
+        except: gname = "NVIDIA GPU"
+        for i in range(n_fans):
+            fans.append({
+                "id":          f"nvidia_fan{i}",
+                "chip":        gname,
+                "label":       f"Fan {i+1}" if n_fans > 1 else "GPU Fan",
+                "type":        "nvidia",
+                "fan_idx":     i,
+                "can_control": True,
+            })
+    return fans
+
+
+def _read_fan_speed(fan: dict) -> tuple:
+    """Returns (value: int, unit: str)."""
+    if fan["type"] == "nvidia":
+        try:
+            idx = fan.get("fan_idx", 0)
+            try:    return pynvml.nvmlDeviceGetFanSpeed_v2(_nvh, idx), "%"
+            except: return pynvml.nvmlDeviceGetFanSpeed(_nvh), "%"
+        except: return 0, "%"
+    try:    return int(Path(fan["rpm_path"]).read_text().strip()), "RPM"
+    except: return 0, "RPM"
+
+
+def _set_hwmon_fan(pwm_path: str, pct: int):
+    """Manual PWM control for hwmon fan. pct = 0-100."""
+    pwm = str(int(pct / 100 * 255)).encode()
+    subprocess.run(["sudo", "tee", pwm_path + "_enable"], input=b"1", capture_output=True, timeout=3)
+    subprocess.run(["sudo", "tee", pwm_path],             input=pwm,  capture_output=True, timeout=3)
+
+
+def _set_hwmon_fan_auto(pwm_path: str):
+    """Return hwmon fan to automatic (firmware/BIOS) control."""
+    subprocess.run(["sudo", "tee", pwm_path + "_enable"], input=b"2", capture_output=True, timeout=3)
+
+
 # ── GPU profile persistence ───────────────────────────────────────────────────
 _PROF_DIR  = Path.home() / ".config" / "thermalwatch"
 _PROF_FILE = _PROF_DIR / "gpu_profiles.json"
@@ -1543,6 +1607,314 @@ class TaskManagerTab(QWidget):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# FAN CONTROL TAB
+# ═════════════════════════════════════════════════════════════════════════════
+
+class FanCard(QWidget):
+    """One card per detected fan — shows speed, mode toggle, and manual slider."""
+
+    def __init__(self, fan: dict, coolbits: bool = False, parent=None):
+        super().__init__(parent)
+        self._fan      = fan
+        self._coolbits = coolbits
+        self._mode     = "auto"
+        max_v = 100 if fan["type"] == "nvidia" else 4000
+        self._build(max_v)
+        self._update_control_state()
+
+    def _build(self, max_v: int):
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame{{background:{C_CARD.name()};"
+            f"border:1px solid {C_BORDER.name()};border-radius:14px;}}")
+        card.setSizePolicy(_SP.Expanding, _SP.Preferred)
+        lay = QVBoxLayout(card); lay.setContentsMargins(18, 14, 18, 14); lay.setSpacing(8)
+        outer.addWidget(card)
+
+        # ── header: chip + label + live speed value
+        hdr = QHBoxLayout(); hdr.setSpacing(8)
+        nc = QVBoxLayout(); nc.setSpacing(1)
+        chip_lbl = QLabel(self._fan["chip"].upper())
+        chip_lbl.setFont(QFont("", 8, _bold()))
+        chip_lbl.setStyleSheet(f"color:{C_MUTED.name()};letter-spacing:1px;")
+        name_lbl = QLabel(self._fan["label"])
+        name_lbl.setFont(QFont("", 12, _bold()))
+        name_lbl.setStyleSheet(f"color:{C_TEXT.name()};")
+        nc.addWidget(chip_lbl); nc.addWidget(name_lbl)
+        self._speed_val = QLabel("—")
+        self._speed_val.setFont(QFont("", 20, _bold()))
+        self._speed_val.setStyleSheet(f"color:{C_GPU.name()};")
+        self._speed_val.setAlignment(_AL.AlignRight | _AL.AlignVCenter)
+        hdr.addLayout(nc); hdr.addStretch(); hdr.addWidget(self._speed_val)
+        lay.addLayout(hdr)
+
+        # ── sparkline
+        self._spark = MiniGraph(C_GPU, max_v)
+        self._spark.setFixedHeight(36)
+        lay.addWidget(self._spark)
+
+        # ── mode + slider row
+        ctrl = QHBoxLayout(); ctrl.setSpacing(6)
+        self._auto_btn   = _btn("Auto",   C_CPU,  checkable=True, height=26)
+        self._manual_btn = _btn("Manual", C_WARN, checkable=True, height=26)
+        self._auto_btn.setFixedWidth(60); self._manual_btn.setFixedWidth(60)
+        self._auto_btn.setChecked(True)
+        self._auto_btn.clicked.connect(lambda: self._set_mode("auto"))
+        self._manual_btn.clicked.connect(lambda: self._set_mode("manual"))
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, 100); self._slider.setValue(50)
+        self._slider.setEnabled(False)
+        self._slider.setStyleSheet(_slider_css(C_WARN))
+        self._pct_lbl = QLabel("50%")
+        self._pct_lbl.setFixedWidth(34)
+        self._pct_lbl.setStyleSheet(f"color:{C_WARN.name()};font-size:11px;font-weight:700;")
+        self._slider.valueChanged.connect(lambda v: self._pct_lbl.setText(f"{v}%"))
+        self._set_btn = _btn("Set", C_GPU, height=26)
+        self._set_btn.setFixedWidth(42); self._set_btn.setEnabled(False)
+        self._set_btn.clicked.connect(self._on_set)
+        ctrl.addWidget(self._auto_btn); ctrl.addWidget(self._manual_btn)
+        ctrl.addWidget(self._slider, 1); ctrl.addWidget(self._pct_lbl)
+        ctrl.addWidget(self._set_btn)
+        lay.addLayout(ctrl)
+
+        # ── status line
+        self._status = QLabel("")
+        self._status.setStyleSheet(f"color:{C_MUTED.name()};font-size:9px;")
+        lay.addWidget(self._status)
+
+    def _update_control_state(self):
+        fan = self._fan
+        if not fan["can_control"]:
+            self._manual_btn.setEnabled(False)
+            self._status.setText("Read-only — no PWM channel")
+        elif fan["type"] == "nvidia" and not self._coolbits:
+            self._manual_btn.setEnabled(False)
+            self._status.setText("⚠  Manual needs Coolbits — GPU Tuning → Setup Guide")
+            self._status.setStyleSheet(f"color:{C_WARN.name()};font-size:9px;")
+        else:
+            self._manual_btn.setEnabled(True)
+            if not self._status.text().startswith("Manual"):
+                self._status.setText("Driver / BIOS controlled")
+
+    def set_coolbits(self, on: bool):
+        self._coolbits = on
+        self._update_control_state()
+
+    def _set_mode(self, mode: str):
+        if mode == "manual":
+            if self._fan["type"] == "nvidia" and not self._coolbits:
+                self._manual_btn.setChecked(False); return
+            if not self._fan["can_control"]:
+                self._manual_btn.setChecked(False); return
+        self._mode = mode
+        self._auto_btn.setChecked(mode == "auto")
+        self._manual_btn.setChecked(mode == "manual")
+        self._slider.setEnabled(mode == "manual")
+        self._set_btn.setEnabled(mode == "manual")
+        if mode == "auto":
+            self._revert_auto()
+            self._status.setText("Driver / BIOS controlled")
+            self._status.setStyleSheet(f"color:{C_MUTED.name()};font-size:9px;")
+
+    def _revert_auto(self):
+        fan = self._fan
+        if fan["type"] == "nvidia":   _set_fan_auto()
+        elif fan.get("pwm_path"):     _set_hwmon_fan_auto(fan["pwm_path"])
+
+    def _on_set(self):
+        pct = self._slider.value(); fan = self._fan
+        if fan["type"] == "nvidia":   _set_fan_manual(pct)
+        elif fan.get("pwm_path"):     _set_hwmon_fan(fan["pwm_path"], pct)
+        self._status.setText(f"Manual: {pct}%  (Auto to release)")
+        self._status.setStyleSheet(f"color:{C_GPU.name()};font-size:9px;")
+
+    def push_speed(self, value: int, unit: str):
+        self._speed_val.setText(f"{value} {unit}")
+        c = C_MUTED if value == 0 else C_GPU
+        self._speed_val.setStyleSheet(f"color:{c.name()};")
+        self._spark.push(value)
+
+
+class FansTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._coolbits  = False
+        self._fan_cards: dict = {}
+        self._fans:      list = []
+        self._build()
+        QTimer.singleShot(500,  self._detect_coolbits)
+        QTimer.singleShot(300,  self._do_scan)
+        self._timer = QTimer(self, interval=2000)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start()
+
+    def _build(self):
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+
+        # Header
+        hdr = QWidget(); hdr.setFixedHeight(50)
+        hdr.setStyleSheet(f"background:{C_PANEL.name()};border-bottom:1px solid {C_BORDER.name()};")
+        hl = QHBoxLayout(hdr); hl.setContentsMargins(20, 0, 20, 0); hl.setSpacing(10)
+        title = QLabel("Fan Control"); title.setFont(QFont("", 13, _bold()))
+        title.setStyleSheet(f"color:{C_TEXT.name()};")
+        self._hdr_lbl = QLabel("Scanning…")
+        self._hdr_lbl.setStyleSheet(f"color:{C_MUTED.name()};font-size:10px;")
+        rescan_btn = _btn("Rescan", C_CPU, height=30)
+        rescan_btn.clicked.connect(self._do_scan)
+        guide_btn  = _btn("Setup Guide", C_OC, height=30)
+        guide_btn.clicked.connect(self._show_guide)
+        hl.addWidget(title); hl.addWidget(self._hdr_lbl); hl.addStretch()
+        hl.addWidget(guide_btn); hl.addWidget(rescan_btn)
+        lay.addWidget(hdr)
+
+        # Scroll body
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea{border:none;}")
+        self._body = QWidget(); self._body.setStyleSheet(f"background:{C_BG.name()};")
+        self._body_lay = QVBoxLayout(self._body)
+        self._body_lay.setContentsMargins(20, 20, 20, 20); self._body_lay.setSpacing(12)
+        scroll.setWidget(self._body)
+        lay.addWidget(scroll, 1)
+
+    def _clear_body(self):
+        while self._body_lay.count():
+            item = self._body_lay.takeAt(0)
+            w = item.widget()
+            if w: w.deleteLater()
+        self._fan_cards.clear(); self._fans.clear()
+
+    def _do_scan(self):
+        self._clear_body()
+        fans = _discover_fans()
+        self._fans = fans
+
+        if not fans:
+            self._hdr_lbl.setText("No fans detected")
+            self._body_lay.addWidget(self._no_fans_card())
+        else:
+            gpu_fans  = [f for f in fans if f["type"] == "nvidia"]
+            sys_fans  = [f for f in fans if f["type"] == "hwmon"]
+
+            if gpu_fans:
+                self._body_lay.addWidget(self._section("GPU Fans"))
+                row = self._fan_row(gpu_fans)
+                self._body_lay.addWidget(row)
+
+            if sys_fans:
+                self._body_lay.addWidget(self._section("System / Case Fans"))
+                row = self._fan_row(sys_fans)
+                self._body_lay.addWidget(row)
+
+            n = len(fans)
+            self._hdr_lbl.setText(
+                f"{n} fan{'s' if n != 1 else ''} detected  ·  "
+                f"{'Coolbits active' if self._coolbits else '⚠ Coolbits needed for GPU manual control'}")
+
+        self._body_lay.addStretch()
+
+    def _fan_row(self, fans: list) -> QWidget:
+        """Lay fans out in a 2-column grid."""
+        w = QWidget(); row = QHBoxLayout(w); row.setContentsMargins(0,0,0,0); row.setSpacing(12)
+        left_col  = QVBoxLayout(); left_col.setSpacing(12)
+        right_col = QVBoxLayout(); right_col.setSpacing(12)
+        for i, fan in enumerate(fans):
+            card = FanCard(fan, self._coolbits)
+            self._fan_cards[fan["id"]] = card
+            (left_col if i % 2 == 0 else right_col).addWidget(card)
+        if len(fans) % 2 == 1:
+            right_col.addStretch()
+        row.addLayout(left_col, 1); row.addLayout(right_col, 1)
+        return w
+
+    def _section(self, title: str) -> QLabel:
+        lbl = QLabel(title.upper()); lbl.setFont(QFont("", 8, _bold()))
+        lbl.setStyleSheet(f"color:{C_MUTED.name()};letter-spacing:2px;")
+        return lbl
+
+    def _no_fans_card(self) -> QFrame:
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame{{background:{C_CARD.name()};"
+            f"border:1px solid {C_BORDER.name()};border-radius:14px;}}")
+        lay = QVBoxLayout(card); lay.setContentsMargins(28, 28, 28, 28); lay.setSpacing(10)
+        lay.setAlignment(_AL.AlignHCenter)
+
+        icon = QLabel("💨"); icon.setFont(QFont("", 36))
+        icon.setAlignment(_AL.AlignHCenter)
+        title = QLabel("No fan sensors detected")
+        title.setFont(QFont("", 14, _bold()))
+        title.setAlignment(_AL.AlignHCenter)
+        title.setStyleSheet(f"color:{C_TEXT.name()};")
+
+        def _row(t): l=QLabel(t); l.setAlignment(_AL.AlignHCenter); l.setStyleSheet(f"color:{C_MUTED.name()};font-size:11px;"); return l
+
+        lay.addWidget(icon); lay.addWidget(title)
+        lay.addWidget(_div())
+        lay.addWidget(_row("Your NVIDIA GPU fan is shown here when NVML is available."))
+        lay.addWidget(_row("For CPU / case fans, the motherboard's super-I/O chip must be"))
+        lay.addWidget(_row("exposed as a kernel hwmon device."))
+        lay.addSpacing(8)
+        lay.addWidget(_row("To enable:  sudo apt install lm-sensors  &&  sudo sensors-detect"))
+        lay.addWidget(_row("Then reboot or run:  sudo modprobe <detected_module>"))
+        lay.addSpacing(8)
+        guide_btn = _btn("Open Setup Guide", C_OC, height=32)
+        guide_btn.setFixedWidth(180); guide_btn.clicked.connect(self._show_guide)
+        lay.addWidget(guide_btn, alignment=_AL.AlignHCenter)
+        return card
+
+    def _detect_coolbits(self):
+        self._coolbits = _check_coolbits()
+        for card in self._fan_cards.values():
+            if card._fan["type"] == "nvidia":
+                card.set_coolbits(self._coolbits)
+        # Update header
+        if self._fans:
+            n = len(self._fans)
+            self._hdr_lbl.setText(
+                f"{n} fan{'s' if n != 1 else ''} detected  ·  "
+                f"{'Coolbits active' if self._coolbits else '⚠ Coolbits needed for GPU manual control'}")
+
+    def _refresh(self):
+        for fan_id, card in self._fan_cards.items():
+            val, unit = _read_fan_speed(card._fan)
+            card.push_speed(val, unit)
+
+    def on_tick(self, d: dict):
+        """Called by main collector tick — update NVIDIA fan speed from live data."""
+        gi = d.get("gpu", {})
+        for card in self._fan_cards.values():
+            if card._fan["type"] == "nvidia":
+                card.push_speed(gi.get("fan", 0), "%")
+
+    def _show_guide(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Fan Sensor Setup Guide")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        msg.setText("""
+<b>NVIDIA GPU fan</b> is controlled via <code>nvidia-settings</code> (Coolbits required for manual mode).<br>
+See <b>GPU Tuning → Setup Guide</b> for Coolbits instructions.<br><br>
+
+<b>CPU / case fans</b> require the motherboard's super-I/O chip to be detected by the kernel.<br><br>
+
+<b>Step 1 — Install lm-sensors:</b>
+<pre style='background:#0d0d1a;padding:8px;border-radius:6px;font-size:12px;'>sudo apt install lm-sensors</pre>
+
+<b>Step 2 — Detect sensors (interactive):</b>
+<pre style='background:#0d0d1a;padding:8px;border-radius:6px;font-size:12px;'>sudo sensors-detect</pre>
+Answer <b>YES</b> to all prompts. At the end it will tell you which modules to load.
+
+<b>Step 3 — Load the module immediately (example):</b>
+<pre style='background:#0d0d1a;padding:8px;border-radius:6px;font-size:12px;'>sudo modprobe nct6775   # replace with your detected module</pre>
+
+<b>Step 4 — Click Rescan</b> in NovaMon — fan entries should appear.<br><br>
+
+To make the module load on boot, add it to <code>/etc/modules</code>.
+        """)
+        msg.exec()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1583,9 +1955,11 @@ class MainWindow(QMainWindow):
         """)
         self._overview_tab   = OverviewTab()
         self._gpu_tuning_tab = GPUTuningTab()
+        self._fans_tab       = FansTab()
         self._task_mgr_tab   = TaskManagerTab()
         tabs.addTab(self._overview_tab,   "Overview")
         tabs.addTab(self._gpu_tuning_tab, "GPU Tuning")
+        tabs.addTab(self._fans_tab,       "Fans")
         tabs.addTab(self._task_mgr_tab,   "Processes")
         root.addWidget(tabs, 1)
 
@@ -1674,6 +2048,7 @@ class MainWindow(QMainWindow):
     def _on_tick(self, d: dict):
         self._overview_tab.on_tick(d)
         self._gpu_tuning_tab.on_tick(d)
+        self._fans_tab.on_tick(d)
         self._gov_row.set(d["gov"])
 
     def _on_profile(self, key: str):
