@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""ThermalWatch — Unified Temperature & Performance Monitor for Linux
-   v2: adds MSI Afterburner-style GPU Tuning tab
-"""
+"""NovaMon — Unified Temperature, Performance & Process Monitor for Linux"""
 
-import sys, os, math, subprocess, time, json
+import sys, os, math, subprocess, time, json, signal
 from datetime import datetime
 from pathlib import Path
 from collections import deque
@@ -12,42 +10,70 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QFrame, QSizePolicy, QSlider, QTabWidget,
-        QScrollArea, QMessageBox,
+        QScrollArea, QMessageBox, QTableView, QLineEdit,
+        QHeaderView, QAbstractItemView, QStyledItemDelegate,
+        QSystemTrayIcon, QMenu,
     )
-    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF, pyqtSlot
+    from PyQt6.QtCore import (
+        Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF, pyqtSlot,
+        QAbstractTableModel, QSortFilterProxyModel, QModelIndex,
+    )
     from PyQt6.QtGui import (
         QPainter, QPen, QBrush, QColor, QFont, QFontMetrics,
         QLinearGradient, QPainterPath, QPalette,
+        QIcon, QPixmap, QRadialGradient, QAction,
     )
-    _SP = QSizePolicy.Policy
-    _AL = Qt.AlignmentFlag
-    _PS = Qt.PenStyle
-    _CS = Qt.CursorShape
-    _BS = Qt.BrushStyle
-    _PC = Qt.PenCapStyle
-    _RH = QPainter.RenderHint
-    _FW = QFont.Weight
-    _MB = Qt.MouseButton
+    _SP   = QSizePolicy.Policy
+    _AL   = Qt.AlignmentFlag
+    _PS   = Qt.PenStyle
+    _CS   = Qt.CursorShape
+    _BS   = Qt.BrushStyle
+    _PC   = Qt.PenCapStyle
+    _RH   = QPainter.RenderHint
+    _FW   = QFont.Weight
+    _MB   = Qt.MouseButton
+    _DR   = Qt.ItemDataRole
+    _OR   = Qt.Orientation
+    _SO   = Qt.SortOrder
+    _SEL  = QAbstractItemView.SelectionBehavior
+    _SELM = QAbstractItemView.SelectionMode
+    _ET   = QAbstractItemView.EditTrigger
+    _HRM  = QHeaderView.ResizeMode
+    _TRAY = QSystemTrayIcon.ActivationReason
 except ImportError:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QFrame, QSizePolicy, QSlider, QTabWidget,
-        QScrollArea, QMessageBox,
+        QScrollArea, QMessageBox, QTableView, QLineEdit,
+        QHeaderView, QAbstractItemView, QStyledItemDelegate,
+        QSystemTrayIcon, QMenu, QAction,
     )
-    from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF, pyqtSlot
+    from PyQt5.QtCore import (
+        Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF, pyqtSlot,
+        QAbstractTableModel, QSortFilterProxyModel, QModelIndex,
+    )
     from PyQt5.QtGui import (
         QPainter, QPen, QBrush, QColor, QFont, QFontMetrics,
         QLinearGradient, QPainterPath, QPalette,
+        QIcon, QPixmap, QRadialGradient,
     )
-    _SP = QSizePolicy
-    _AL = Qt
-    _PS = Qt
-    _CS = Qt
-    _BS = Qt
-    _PC = Qt
-    _RH = QPainter
-    _FW = QFont
-    _MB = Qt
+    _SP   = QSizePolicy
+    _AL   = Qt
+    _PS   = Qt
+    _CS   = Qt
+    _BS   = Qt
+    _PC   = Qt
+    _RH   = QPainter
+    _FW   = QFont
+    _MB   = Qt
+    _DR   = Qt
+    _OR   = Qt
+    _SO   = Qt
+    _SEL  = QAbstractItemView
+    _SELM = QAbstractItemView
+    _ET   = QAbstractItemView
+    _HRM  = QHeaderView
+    _TRAY = QSystemTrayIcon
 
 import psutil
 
@@ -76,6 +102,104 @@ C_GPU    = QColor("#00e5a0")
 C_WARN   = QColor("#ffb347")
 C_CRIT   = QColor("#ff5252")
 C_OC     = QColor("#a78bfa")   # purple accent for OC features
+
+# ── App icon ──────────────────────────────────────────────────────────────────
+def _draw_icon(size: int) -> "QPixmap":
+    pm = QPixmap(size, size)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm); p.setRenderHint(_RH.Antialiasing)
+    s = size
+
+    # Rounded square background
+    bg = QLinearGradient(0, 0, 0, s)
+    bg.setColorAt(0, QColor("#1a1a3e")); bg.setColorAt(1, QColor("#0b0b18"))
+    p.setPen(_PS.NoPen); p.setBrush(QBrush(bg))
+    p.drawRoundedRect(0, 0, s, s, s * 0.14, s * 0.14)
+
+    # Monitor frame
+    marg = s * 0.06; mon_w = s * 0.88; mon_h = s * 0.66
+    mx = (s - mon_w) / 2; my = marg
+    p.setBrush(QBrush(QColor("#1c1c3a")))
+    p.setPen(QPen(C_CPU, max(1.0, s / 48.0)))
+    p.drawRoundedRect(int(mx), int(my), int(mon_w), int(mon_h), s * 0.06, s * 0.06)
+
+    # Screen
+    sp = s * 0.055
+    sx, sy = mx + sp, my + sp
+    sw, sh = mon_w - 2 * sp, mon_h - 2 * sp
+    p.setPen(_PS.NoPen); p.setBrush(QBrush(QColor("#060612")))
+    p.drawRoundedRect(int(sx), int(sy), int(sw), int(sh), s * 0.03, s * 0.03)
+
+    # Waveforms (only at sizes large enough to be visible)
+    if size >= 24:
+        n = max(10, size // 3)
+        # CPU waveform — upper half, blue
+        cy1 = sy + sh * 0.32
+        path1 = QPainterPath()
+        for i in range(n + 1):
+            t = i / n
+            x = sx + t * sw
+            y = cy1 - math.sin(t * math.pi * 3.2) * sh * 0.13
+            if i == 0: path1.moveTo(x, y)
+            else:      path1.lineTo(x, y)
+        p.setPen(QPen(C_CPU, max(1.0, s / 56.0))); p.setBrush(_BS.NoBrush)
+        p.drawPath(path1)
+
+        # GPU waveform — lower half, teal
+        cy2 = sy + sh * 0.68
+        path2 = QPainterPath()
+        for i in range(n + 1):
+            t = i / n
+            x = sx + t * sw
+            y = cy2 - math.sin(t * math.pi * 2.4 + 1.1) * sh * 0.12
+            if i == 0: path2.moveTo(x, y)
+            else:      path2.lineTo(x, y)
+        p.setPen(QPen(C_GPU, max(1.0, s / 56.0)))
+        p.drawPath(path2)
+
+    # Live indicator dot (top-right of screen)
+    dr = max(1.5, s * 0.042)
+    dx = sx + sw - dr * 2.8; dy = sy + dr * 2.2
+    glow = QRadialGradient(dx, dy, dr * 3)
+    gc = QColor(C_GPU); gc.setAlpha(0)
+    glow.setColorAt(0, C_GPU); glow.setColorAt(0.45, C_GPU); glow.setColorAt(1, gc)
+    p.setPen(_PS.NoPen); p.setBrush(QBrush(glow))
+    p.drawEllipse(QPointF(dx, dy), dr * 3, dr * 3)
+    p.setBrush(QBrush(C_GPU))
+    p.drawEllipse(QPointF(dx, dy), dr, dr)
+
+    # Stand (neck + base) for larger sizes
+    if size >= 32:
+        nw = s * 0.09; nh = s * 0.09
+        nx = (s - nw) / 2; ny = my + mon_h
+        p.setBrush(QBrush(QColor("#1c1c3a"))); p.setPen(_PS.NoPen)
+        p.drawRect(int(nx), int(ny), int(nw), int(nh))
+        bw = s * 0.42; bh = max(3.0, s * 0.06)
+        bx = (s - bw) / 2; by = ny + nh
+        p.drawRoundedRect(int(bx), int(by), int(bw), int(bh), s * 0.03, s * 0.03)
+
+    p.end()
+    return pm
+
+
+def _make_app_icon() -> "QIcon":
+    icon = QIcon()
+    for sz in (16, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(_draw_icon(sz))
+    return icon
+
+
+def _install_icon():
+    """Write PNG files into ~/.local/share/icons/hicolor so the DE picks them up."""
+    try:
+        base = Path.home() / ".local" / "share" / "icons" / "hicolor"
+        for sz in (16, 24, 32, 48, 64, 128, 256):
+            dest = base / f"{sz}x{sz}" / "apps"
+            dest.mkdir(parents=True, exist_ok=True)
+            _draw_icon(sz).save(str(dest / "novamon.png"))
+    except Exception:
+        pass   # non-fatal — window icon still works
+
 
 # ── Tiny utilities ────────────────────────────────────────────────────────────
 def _clamp(v, lo, hi):  return max(lo, min(hi, v))
@@ -224,6 +348,23 @@ def _save_gpu_profile(slot: int, data: dict):
 def _load_gpu_profiles() -> dict:
     try: return json.loads(_PROF_FILE.read_text()) if _PROF_FILE.exists() else {}
     except: return {}
+
+# ── Process kill helper ───────────────────────────────────────────────────────
+def _kill_proc(pid: int, force: bool = False) -> tuple:
+    sig     = signal.SIGKILL if force else signal.SIGTERM
+    sig_str = "-9" if force else "-15"
+    try:
+        os.kill(pid, sig)
+        return True, "Signal sent"
+    except ProcessLookupError:
+        return False, "Process not found"
+    except PermissionError:
+        r = subprocess.run(["sudo", "kill", sig_str, str(pid)],
+                           capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            return True, "Killed (elevated)"
+        return False, (r.stderr.strip() or "sudo kill failed")
+
 
 # ── CPU performance profiles ──────────────────────────────────────────────────
 PROFILES = {
@@ -1137,16 +1278,283 @@ EndSection
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# TASK MANAGER
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ProcCache:
+    """Maintains psutil.Process objects across refreshes for accurate cpu_percent()."""
+    def __init__(self):
+        self._cache: dict = {}
+
+    def snapshot(self) -> list:
+        current_pids: set = set()
+        rows: list = []
+        attrs = ["pid", "name", "username", "status", "memory_info"]
+        for proc in psutil.process_iter(attrs):
+            try:
+                info = proc.info
+                pid  = info["pid"]
+                current_pids.add(pid)
+                if pid not in self._cache:
+                    self._cache[pid] = proc
+                    proc.cpu_percent(interval=None)  # prime — returns 0 on first call
+                    cpu = 0.0
+                else:
+                    try:   cpu = self._cache[pid].cpu_percent(interval=None)
+                    except Exception:
+                        self._cache[pid] = proc
+                        proc.cpu_percent(interval=None)
+                        cpu = 0.0
+                try:   mem = info["memory_info"].rss // (1024 * 1024) if info.get("memory_info") else 0
+                except Exception: mem = 0
+                rows.append({
+                    "pid":    pid,
+                    "name":   info.get("name") or "",
+                    "cpu":    cpu,
+                    "mem":    mem,
+                    "user":   info.get("username") or "",
+                    "status": info.get("status")   or "",
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        for pid in list(self._cache):
+            if pid not in current_pids:
+                del self._cache[pid]
+        rows.sort(key=lambda r: r["cpu"], reverse=True)
+        return rows
+
+
+class ProcessModel(QAbstractTableModel):
+    COLS = ["PID", "Name", "CPU %", "Memory", "User", "Status"]
+    COL_PID, COL_NAME, COL_CPU, COL_MEM, COL_USER, COL_STATUS = range(6)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list = []
+
+    def update_rows(self, rows: list):
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def rowCount(self, parent=None):    return len(self._rows)
+    def columnCount(self, parent=None): return len(self.COLS)
+
+    def headerData(self, section, orientation, role=None):
+        if role == _DR.DisplayRole and orientation == _OR.Horizontal:
+            return self.COLS[section]
+        return None
+
+    def data(self, index, role=None):
+        if not index.isValid() or index.row() >= len(self._rows):
+            return None
+        row = self._rows[index.row()]
+        col = index.column()
+        if role == _DR.DisplayRole:
+            if col == self.COL_PID:    return str(row["pid"])
+            if col == self.COL_NAME:   return row["name"]
+            if col == self.COL_CPU:    return f"{row['cpu']:.1f}"
+            if col == self.COL_MEM:    return f"{row['mem']} MB"
+            if col == self.COL_USER:   return row["user"]
+            if col == self.COL_STATUS: return row["status"]
+        if role == _DR.UserRole:
+            if col == self.COL_PID:  return row["pid"]
+            if col == self.COL_CPU:  return row["cpu"]
+            if col == self.COL_MEM:  return row["mem"]
+            return self.data(index, _DR.DisplayRole)
+        if role == _DR.ForegroundRole:
+            if col == self.COL_CPU:
+                cpu = row["cpu"]
+                if cpu > 50: return QBrush(C_CRIT)
+                if cpu > 20: return QBrush(C_WARN)
+                return QBrush(C_GPU)
+        return None
+
+    def get_row(self, row_idx: int):
+        return self._rows[row_idx] if 0 <= row_idx < len(self._rows) else None
+
+
+class ProcProxyModel(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._filter = ""
+
+    def set_filter(self, text: str):
+        self._filter = text.lower().strip()
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, row: int, parent) -> bool:
+        if not self._filter: return True
+        src = self.sourceModel()
+        if src is None: return True
+        name = src.data(src.index(row, ProcessModel.COL_NAME), _DR.DisplayRole) or ""
+        pid  = src.data(src.index(row, ProcessModel.COL_PID),  _DR.DisplayRole) or ""
+        return self._filter in name.lower() or self._filter in pid
+
+    def lessThan(self, left, right) -> bool:
+        lv = left.data(_DR.UserRole)
+        rv = right.data(_DR.UserRole)
+        try:    return float(lv) < float(rv)
+        except: return str(lv or "") < str(rv or "")
+
+
+class CpuDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        cpu_val = index.data(_DR.UserRole)
+        if cpu_val is None: return
+        try:   cpu = float(cpu_val)
+        except: return
+        c = C_CRIT if cpu > 50 else C_WARN if cpu > 20 else C_GPU
+        r = option.rect; bar_h = 3
+        bar_w = int(r.width() * min(cpu / 100.0, 1.0))
+        painter.save()
+        if bar_w > 0:
+            painter.setPen(_PS.NoPen); painter.setBrush(QBrush(c))
+            painter.drawRect(r.x(), r.bottom() - bar_h, bar_w, bar_h)
+        txt = f"{cpu:.1f}%"
+        fm  = QFontMetrics(painter.font())
+        tw  = fm.horizontalAdvance(txt); th = fm.height()
+        painter.setPen(QPen(c)); painter.setBrush(_BS.NoBrush)
+        painter.drawText(r.right() - tw - 6, r.top() + (r.height() - bar_h - th) // 2 + th, txt)
+        painter.restore()
+
+
+class TaskManagerTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cache = ProcCache()
+        self._build()
+        self._timer = QTimer(self, interval=2000)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start()
+        QTimer.singleShot(100, self._refresh)
+
+    def _build(self):
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(0)
+
+        # Header bar
+        hdr = QWidget(); hdr.setFixedHeight(50)
+        hdr.setStyleSheet(f"background:{C_PANEL.name()};border-bottom:1px solid {C_BORDER.name()};")
+        hl = QHBoxLayout(hdr); hl.setContentsMargins(20, 0, 20, 0); hl.setSpacing(10)
+        title = QLabel("Task Manager"); title.setFont(QFont("", 13, _bold()))
+        title.setStyleSheet(f"color:{C_TEXT.name()};")
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search by name or PID…")
+        self._search.setFixedWidth(220); self._search.setFixedHeight(28)
+        self._search.setStyleSheet(f"""
+            QLineEdit{{background:{C_CARD.name()};border:1px solid {C_BORDER.name()};
+                border-radius:5px;color:{C_TEXT.name()};padding:0 8px;font-size:11px;}}
+            QLineEdit:focus{{border-color:{C_CPU.name()};}}
+        """)
+        self._kill_btn  = _btn("Kill",       C_WARN, height=28)
+        self._fkill_btn = _btn("Force Kill", C_CRIT, height=28)
+        self._kill_btn.clicked.connect(lambda:  self._on_kill(False))
+        self._fkill_btn.clicked.connect(lambda: self._on_kill(True))
+        hl.addWidget(title); hl.addStretch()
+        hl.addWidget(self._search); hl.addSpacing(8)
+        hl.addWidget(self._kill_btn); hl.addWidget(self._fkill_btn)
+        lay.addWidget(hdr)
+
+        # Table
+        self._model = ProcessModel()
+        self._proxy = ProcProxyModel()
+        self._proxy.setSourceModel(self._model)
+        self._search.textChanged.connect(self._proxy.set_filter)
+
+        self._table = QTableView()
+        self._table.setModel(self._proxy)
+        self._table.setSortingEnabled(True)
+        self._table.sortByColumn(ProcessModel.COL_CPU, _SO.DescendingOrder)
+        self._table.setStyleSheet(f"""
+            QTableView{{background:{C_BG.name()};border:none;
+                gridline-color:{C_BORDER.name()};
+                alternate-background-color:{C_CARD.name()};
+                color:{C_TEXT.name()};font-size:11px;}}
+            QTableView::item:selected{{background:rgba(78,154,241,22);}}
+            QHeaderView::section{{background:{C_PANEL.name()};color:{C_MUTED.name()};
+                border:none;border-bottom:1px solid {C_BORDER.name()};
+                border-right:1px solid {C_BORDER.name()};
+                padding:4px 8px;font-size:10px;letter-spacing:1px;}}
+            QHeaderView::section:hover{{color:{C_TEXT.name()};}}
+            QHeaderView::section:pressed{{background:{C_CARD.name()};}}
+        """)
+        self._table.setAlternatingRowColors(True)
+        self._table.setSelectionBehavior(_SEL.SelectRows)
+        self._table.setSelectionMode(_SELM.SingleSelection)
+        self._table.setEditTriggers(_ET.NoEditTriggers)
+        hdr_h = self._table.horizontalHeader()
+        hdr_h.setSectionResizeMode(ProcessModel.COL_NAME, _HRM.Stretch)
+        hdr_h.setSortIndicatorShown(True)
+        self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(24)
+        self._table.setShowGrid(True)
+        self._table.setItemDelegateForColumn(ProcessModel.COL_CPU, CpuDelegate(self))
+        for col, w in ((ProcessModel.COL_PID, 62), (ProcessModel.COL_CPU, 72),
+                       (ProcessModel.COL_MEM, 88), (ProcessModel.COL_USER, 100),
+                       (ProcessModel.COL_STATUS, 74)):
+            self._table.setColumnWidth(col, w)
+        lay.addWidget(self._table, 1)
+
+        # Status bar
+        self._status = QLabel("  Loading…")
+        self._status.setFixedHeight(24)
+        self._status.setStyleSheet(
+            f"background:{C_PANEL.name()};color:{C_MUTED.name()};"
+            f"font-size:10px;padding:0 4px;"
+            f"border-top:1px solid {C_BORDER.name()};")
+        lay.addWidget(self._status)
+
+    def _refresh(self):
+        rows = self._cache.snapshot()
+        self._model.update_rows(rows)
+        total_cpu = sum(r["cpu"] for r in rows)
+        vm  = psutil.virtual_memory()
+        ram_used  = vm.used  // (1024 ** 3)
+        ram_total = vm.total // (1024 ** 3)
+        self._status.setText(
+            f"  {len(rows)} processes  ·  CPU {total_cpu:.1f}%  ·  "
+            f"RAM {ram_used}/{ram_total} GB  ·  "
+            f"Updated {datetime.now().strftime('%H:%M:%S')}")
+
+    def _on_kill(self, force: bool):
+        sel = self._table.selectionModel().selectedRows()
+        if not sel: return
+        src_idx = self._proxy.mapToSource(sel[0])
+        row = self._model.get_row(src_idx.row())
+        if not row: return
+        pid  = row["pid"]
+        name = row["name"]
+        sig_label = "SIGKILL (force)" if force else "SIGTERM"
+        reply = QMessageBox.question(
+            self, "Confirm Kill",
+            f"Send {sig_label} to:\n\n  PID {pid}  —  {name}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes: return
+        ok, msg = _kill_proc(pid, force)
+        if ok:
+            self._status.setText(f"  ✓  {name} ({pid}): {msg}")
+            QTimer.singleShot(800, self._refresh)
+        else:
+            QMessageBox.warning(self, "Kill Failed",
+                                f"Could not kill {name} ({pid}):\n{msg}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═════════════════════════════════════════════════════════════════════════════
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ThermalWatch")
+        self.setWindowTitle("NovaMon")
         self.setMinimumSize(920, 640)
         self._profile_key  = "balanced"
         self._profile_btns = {}
+        _icon = _make_app_icon()
+        self.setWindowIcon(_icon)
         self._build_ui()
         self._start()
 
@@ -1175,8 +1583,10 @@ class MainWindow(QMainWindow):
         """)
         self._overview_tab   = OverviewTab()
         self._gpu_tuning_tab = GPUTuningTab()
+        self._task_mgr_tab   = TaskManagerTab()
         tabs.addTab(self._overview_tab,   "Overview")
         tabs.addTab(self._gpu_tuning_tab, "GPU Tuning")
+        tabs.addTab(self._task_mgr_tab,   "Processes")
         root.addWidget(tabs, 1)
 
     def _build_sidebar(self) -> QWidget:
@@ -1187,7 +1597,7 @@ class MainWindow(QMainWindow):
         hdr = QWidget(); hdr.setFixedHeight(60)
         hdr.setStyleSheet(f"background:{C_PANEL.name()};")
         hl = QHBoxLayout(hdr); hl.setContentsMargins(14, 0, 14, 0)
-        brand = QLabel("Thermal<b>Watch</b>"); brand.setFont(QFont("", 13))
+        brand = QLabel("Nova<b>Mon</b>"); brand.setFont(QFont("", 13))
         brand.setStyleSheet(f"color:{C_TEXT.name()};")
         self._dot = QLabel("●"); self._dot.setStyleSheet(f"color:{C_GPU.name()};font-size:9px;")
         hl.addWidget(brand); hl.addStretch(); hl.addWidget(self._dot)
@@ -1206,7 +1616,7 @@ class MainWindow(QMainWindow):
             self._profile_btns[key] = btn; lay.addWidget(btn)
 
         lay.addStretch()
-        ver = QLabel("v2.0  ·  RTX 5070" if NVIDIA else "v2.0")
+        ver = QLabel("v3.0  ·  RTX 5070" if NVIDIA else "v3.0")
         ver.setStyleSheet(f"color:{C_MUTED.name()};font-size:9px;padding:8px 14px;")
         lay.addWidget(ver)
         return w
@@ -1215,6 +1625,45 @@ class MainWindow(QMainWindow):
         self._col = Collector(); self._col.tick.connect(self._on_tick); self._col.start()
         self._blink_state = True
         QTimer(self, interval=800, timeout=self._blink).start()
+        self._setup_tray()
+
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self._tray = QSystemTrayIcon(self.windowIcon(), self)
+        self._tray.setToolTip("NovaMon — System Monitor")
+
+        menu = QMenu()
+        menu.setStyleSheet(f"""
+            QMenu{{background:{C_CARD.name()};border:1px solid {C_BORDER.name()};
+                color:{C_TEXT.name()};padding:4px;}}
+            QMenu::item{{padding:6px 20px;border-radius:4px;}}
+            QMenu::item:selected{{background:{C_BORDER.name()};color:{C_CPU.name()};}}
+            QMenu::separator{{height:1px;background:{C_BORDER.name()};margin:4px 8px;}}
+        """)
+        show_act = QAction("Show / Hide", self)
+        show_act.triggered.connect(self._toggle_window)
+        quit_act  = QAction("Quit NovaMon", self)
+        quit_act.triggered.connect(QApplication.instance().quit)
+        menu.addAction(show_act)
+        menu.addSeparator()
+        menu.addAction(quit_act)
+
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _toggle_window(self):
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show(); self.raise_(); self.activateWindow()
+
+    def _on_tray_activated(self, reason):
+        try:    trigger = _TRAY.Trigger
+        except: trigger = _TRAY.Trigger   # same attr, different namespace
+        if reason == trigger:
+            self._toggle_window()
 
     def _blink(self):
         self._blink_state = not self._blink_state
@@ -1242,14 +1691,20 @@ class MainWindow(QMainWindow):
             except: pass
 
     def closeEvent(self, e):
-        if hasattr(self, "_col"): self._col.requestInterruption(); self._col.wait(1000)
-        super().closeEvent(e)
+        if hasattr(self, "_tray") and self._tray.isVisible():
+            self.hide(); e.ignore()   # minimize to tray; use Quit from tray menu to exit
+        else:
+            if hasattr(self, "_col"): self._col.requestInterruption(); self._col.wait(1000)
+            super().closeEvent(e)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
-    app = QApplication(sys.argv); app.setApplicationName("ThermalWatch")
+    app = QApplication(sys.argv)
+    app.setApplicationName("NovaMon")
+    app.setQuitOnLastWindowClosed(False)   # keep alive in tray after window close
+    app.setWindowIcon(_make_app_icon())
     pal = QPalette()
     for role, col in (
         (QPalette.ColorRole.Window,        C_BG),
@@ -1262,6 +1717,7 @@ def main():
         (QPalette.ColorRole.Highlight,     C_CPU),
     ): pal.setColor(role, col)
     app.setPalette(pal)
+    _install_icon()
     win = MainWindow(); win.show()
     sys.exit(app.exec())
 

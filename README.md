@@ -25,6 +25,25 @@ Designed after the aesthetic of Tuxedo Control Center and the feature set of MSI
 - **Five profile slots** — save and reload complete tuning states (power limit + offsets + fan curve) to `~/.config/thermalwatch/gpu_profiles.json`
 - **Setup Guide dialog** — in-app instructions for enabling Coolbits
 
+### Processes Tab (Task Manager)
+- Live process list sorted by CPU usage, refreshed every 2 seconds
+- Columns: PID, Name, CPU %, Memory (RSS), User, Status
+- CPU % column shows a mini bar + colour-coded value (green → orange → red)
+- Search/filter by process name or PID in real time
+- Click any column header to sort
+- **Kill** — sends SIGTERM (graceful shutdown) to the selected process
+- **Force Kill** — sends SIGKILL (immediate termination)
+- Both kill operations automatically escalate to `sudo kill` on permission denied
+- Confirmation dialog before any kill signal is sent
+
+### App Icon
+- Custom painted icon generated at 7 sizes (16 → 256 px) at runtime
+- Dark rounded-square background with monitor frame (blue border)
+- CPU waveform (blue) and GPU waveform (teal) visible on the screen
+- Green live-indicator dot in the top-right corner of the screen
+- Monitor stand (neck + base) rendered at 32 px and above
+- Set on both the `QApplication` instance and the main window
+
 ### Performance Profiles (sidebar)
 Three system-wide profiles that set the CPU governor and scale NVIDIA power limit together:
 
@@ -193,7 +212,7 @@ Each profile stores:
 
 ## Architecture
 
-Single-file application: `thermalwatch.py` (~1270 lines).
+Single-file application: `thermalwatch.py` (~1670 lines).
 
 ```
 MainWindow
@@ -210,14 +229,20 @@ MainWindow
     │   ├── Sparkline (GPU history, 90s)
     │   └── InfoRow × 5  (freq, governor, VRAM, power, clocks)
     │
-    └── GPUTuningTab
-        ├── Header bar  (status label, Apply, Reset, Setup Guide)
-        ├── SliderControl × 3  (Power Limit, Core Offset, Mem Offset)
-        ├── MetricRow × 6  (each has MiniGraph sparkline)
-        ├── FanCurveEditor  (interactive, mouse-driven)
-        └── ProfileBar  (5 slots, Save / Load)
+    ├── GPUTuningTab
+    │   ├── Header bar  (status label, Apply, Reset, Setup Guide)
+    │   ├── SliderControl × 3  (Power Limit, Core Offset, Mem Offset)
+    │   ├── MetricRow × 6  (each has MiniGraph sparkline)
+    │   ├── FanCurveEditor  (interactive, mouse-driven)
+    │   └── ProfileBar  (5 slots, Save / Load)
+    │
+    └── TaskManagerTab
+        ├── Header bar  (title, search box, Kill, Force Kill)
+        ├── QTableView  (ProcProxyModel → ProcessModel, sortable + filterable)
+        └── Status bar  (count, total CPU, RAM, timestamp)
 
 Collector (QThread)  →  tick signal (every 1s)  →  OverviewTab + GPUTuningTab
+ProcCache            →  snapshot() every 2s     →  TaskManagerTab
 ```
 
 **Data flow:**
