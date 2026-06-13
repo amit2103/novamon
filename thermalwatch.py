@@ -10,8 +10,8 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QFrame, QSizePolicy, QSlider, QTabWidget,
-        QScrollArea, QMessageBox, QTableView, QLineEdit,
-        QHeaderView, QAbstractItemView, QStyledItemDelegate,
+        QScrollArea, QMessageBox, QTableView, QTableWidget, QTableWidgetItem,
+        QLineEdit, QHeaderView, QAbstractItemView, QStyledItemDelegate,
         QSystemTrayIcon, QMenu,
     )
     from PyQt6.QtCore import (
@@ -44,8 +44,8 @@ except ImportError:
     from PyQt5.QtWidgets import (
         QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
         QLabel, QPushButton, QFrame, QSizePolicy, QSlider, QTabWidget,
-        QScrollArea, QMessageBox, QTableView, QLineEdit,
-        QHeaderView, QAbstractItemView, QStyledItemDelegate,
+        QScrollArea, QMessageBox, QTableView, QTableWidget, QTableWidgetItem,
+        QLineEdit, QHeaderView, QAbstractItemView, QStyledItemDelegate,
         QSystemTrayIcon, QMenu, QAction,
     )
     from PyQt5.QtCore import (
@@ -436,6 +436,89 @@ def _disk_info() -> list:
     return list(groups.values())
 
 
+# ── Network sensors ───────────────────────────────────────────────────────────
+import socket as _socket
+
+_net_prev: dict = {}   # iface → (snetio, timestamp)
+
+def _net_rates() -> dict:
+    """Returns {iface: (upload_MB_s, download_MB_s)} since last call."""
+    global _net_prev
+    now = time.time()
+    try:
+        stats = psutil.net_io_counters(pernic=True)
+    except Exception:
+        return {}
+    rates = {}
+    for iface, s in stats.items():
+        if iface in _net_prev:
+            prev_s, prev_t = _net_prev[iface]
+            dt = now - prev_t
+            if dt > 0:
+                up = (s.bytes_sent - prev_s.bytes_sent) / dt / 1_048_576
+                dn = (s.bytes_recv - prev_s.bytes_recv) / dt / 1_048_576
+                rates[iface] = (max(0.0, up), max(0.0, dn))
+        _net_prev[iface] = (s, now)
+    return rates
+
+def _net_ifaces() -> list:
+    """Return list of active interface dicts (skip loopback + never-used)."""
+    try:
+        addrs = psutil.net_if_addrs()
+        stats = psutil.net_io_counters(pernic=True)
+    except Exception:
+        return []
+    result = []
+    for iface, s in stats.items():
+        if iface == "lo":
+            continue
+        if s.bytes_sent == 0 and s.bytes_recv == 0:
+            continue
+        ip = ""
+        for a in addrs.get(iface, []):
+            if a.family == _socket.AF_INET:
+                ip = a.address; break
+        result.append({
+            "iface":       iface,
+            "ip":          ip,
+            "bytes_sent":  s.bytes_sent,
+            "bytes_recv":  s.bytes_recv,
+        })
+    return result
+
+
+# ── GPU process list ───────────────────────────────────────────────────────────
+def _gpu_processes() -> list:
+    """Return [{pid, name, vram_mb}] sorted by VRAM descending."""
+    if not NVIDIA or not _nvh:
+        return []
+    procs, seen = [], set()
+    try:
+        for fn in (pynvml.nvmlDeviceGetComputeRunningProcesses,
+                   pynvml.nvmlDeviceGetGraphicsRunningProcesses):
+            try:
+                for p in fn(_nvh):
+                    if p.pid not in seen:
+                        seen.add(p.pid)
+                        procs.append(p)
+            except Exception:
+                pass
+    except Exception:
+        return []
+    result = []
+    for p in procs:
+        try:
+            name = psutil.Process(p.pid).name()
+        except Exception:
+            try:
+                name = Path(f"/proc/{p.pid}/comm").read_text().strip()
+            except Exception:
+                name = f"pid {p.pid}"
+        vram = getattr(p, "usedGpuMemory", 0) or 0
+        result.append({"pid": p.pid, "name": name, "vram_mb": vram // 1_048_576})
+    return sorted(result, key=lambda x: x["vram_mb"], reverse=True)
+
+
 # ── GPU profile persistence ───────────────────────────────────────────────────
 _PROF_DIR  = Path.home() / ".config" / "thermalwatch"
 _PROF_FILE = _PROF_DIR / "gpu_profiles.json"
@@ -500,6 +583,7 @@ class Collector(QThread):
                     "ram":          psutil.virtual_memory(),
                     "swap":         psutil.swap_memory(),
                     "dimm_temps":   _dimm_temps(),
+                    "gpu_procs":    _gpu_processes(),
                 })
             except: pass
             time.sleep(1)
@@ -1283,6 +1367,8 @@ class GPUTuningTab(QWidget):
         mid.addWidget(self._build_monitoring(), 1)
         blay.addLayout(mid)
         blay.addWidget(self._build_fan_section())
+        self._gpu_proc_panel = GpuProcessPanel()
+        blay.addWidget(self._gpu_proc_panel)
 
         scroll.setWidget(body)
         outer.addWidget(scroll, 1)
@@ -1468,6 +1554,7 @@ class GPUTuningTab(QWidget):
         self._m_power.push(gi["power"],    f"{gi['power']:.0f} W")
         self._m_temp.push(d["gpu_t"],      f"{d['gpu_t']:.0f}°C")
         self._m_fan.push(gi["fan"],        f"{gi['fan']}%")
+        self._gpu_proc_panel.update_procs(d.get("gpu_procs", []))
 
     # ── Setup guide dialog ────────────────────────────────────────────────────
     def _show_guide(self):
@@ -1945,6 +2032,167 @@ class StorageTab(QWidget):
 
 
 
+# ── Network Tab ───────────────────────────────────────────────────────────────
+
+class _NetCard(QWidget):
+    """One card per active network interface."""
+    def __init__(self, iface: str, parent=None):
+        super().__init__(parent)
+        self.iface = iface
+        self.setStyleSheet(f"background:{C_CARD.name()};border-radius:10px;")
+        lay = QVBoxLayout(self); lay.setContentsMargins(14, 12, 14, 12); lay.setSpacing(6)
+
+        hdr = QHBoxLayout()
+        name_lbl = QLabel(iface)
+        name_lbl.setStyleSheet(f"color:{C_TEXT.name()};font-size:13px;font-weight:bold;")
+        self._ip_lbl = QLabel("")
+        self._ip_lbl.setStyleSheet(f"color:{C_MUTED.name()};font-size:11px;")
+        hdr.addWidget(name_lbl); hdr.addStretch(); hdr.addWidget(self._ip_lbl)
+        lay.addLayout(hdr)
+
+        io_row = QHBoxLayout(); io_row.setSpacing(16)
+        up_col  = QVBoxLayout(); up_col.setSpacing(2)
+        dn_col  = QVBoxLayout(); dn_col.setSpacing(2)
+
+        up_lbl = QLabel("UPLOAD");   up_lbl.setStyleSheet(f"color:{C_MUTED.name()};font-size:9px;letter-spacing:1px;")
+        dn_lbl = QLabel("DOWNLOAD"); dn_lbl.setStyleSheet(f"color:{C_MUTED.name()};font-size:9px;letter-spacing:1px;")
+        self._up_val  = QLabel("0 B/s");  self._up_val.setStyleSheet(f"color:{C_OC.name()};font-size:14px;font-weight:bold;")
+        self._dn_val  = QLabel("0 B/s");  self._dn_val.setStyleSheet(f"color:{C_GPU.name()};font-size:14px;font-weight:bold;")
+        self._up_spark = Sparkline("↑", C_OC,  max_val=100); self._up_spark.setFixedSize(140, 32)
+        self._dn_spark = Sparkline("↓", C_GPU, max_val=100); self._dn_spark.setFixedSize(140, 32)
+
+        up_col.addWidget(up_lbl); up_col.addWidget(self._up_val); up_col.addWidget(self._up_spark)
+        dn_col.addWidget(dn_lbl); dn_col.addWidget(self._dn_val); dn_col.addWidget(self._dn_spark)
+        io_row.addLayout(up_col); io_row.addLayout(dn_col); io_row.addStretch()
+        lay.addLayout(io_row)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color:{C_BORDER.name()};"); lay.addWidget(sep)
+
+        totals = QHBoxLayout()
+        self._sent_lbl = InfoRow("Total Sent")
+        self._recv_lbl = InfoRow("Total Received")
+        totals.addWidget(self._sent_lbl); totals.addWidget(self._recv_lbl)
+        lay.addLayout(totals)
+
+    @staticmethod
+    def _fmt(mb: float) -> str:
+        if mb < 1:       return f"{mb*1024:.0f} KB/s"
+        if mb < 1024:    return f"{mb:.1f} MB/s"
+        return f"{mb/1024:.2f} GB/s"
+
+    @staticmethod
+    def _fmt_total(b: int) -> str:
+        if b < 1024**2:  return f"{b/1024:.1f} KB"
+        if b < 1024**3:  return f"{b/1024**2:.1f} MB"
+        return f"{b/1024**3:.2f} GB"
+
+    def update_data(self, info: dict, up_mbs: float, dn_mbs: float):
+        self._ip_lbl.setText(info.get("ip", ""))
+        self._up_val.setText(self._fmt(up_mbs))
+        self._dn_val.setText(self._fmt(dn_mbs))
+        self._up_spark.push(int(up_mbs * 10))
+        self._dn_spark.push(int(dn_mbs * 10))
+        self._sent_lbl.set(self._fmt_total(info["bytes_sent"]))
+        self._recv_lbl.set(self._fmt_total(info["bytes_recv"]))
+
+
+class NetworkTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cards: dict = {}
+        outer = QVBoxLayout(self); outer.setContentsMargins(18, 18, 18, 18)
+
+        title = QLabel("Network")
+        title.setStyleSheet(f"color:{C_TEXT.name()};font-size:15px;font-weight:bold;")
+        outer.addWidget(title)
+
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        self._card_lay = QVBoxLayout(inner); self._card_lay.setSpacing(14)
+        self._card_lay.addStretch()
+        scroll.setWidget(inner)
+        outer.addWidget(scroll)
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start(1000)
+        self._refresh()
+
+    def _refresh(self):
+        try:
+            ifaces = _net_ifaces()
+            rates  = _net_rates()
+        except Exception:
+            return
+        for info in ifaces:
+            iface = info["iface"]
+            if iface not in self._cards:
+                card = _NetCard(iface)
+                self._cards[iface] = card
+                self._card_lay.insertWidget(self._card_lay.count() - 1, card)
+            up, dn = rates.get(iface, (0.0, 0.0))
+            self._cards[iface].update_data(info, up, dn)
+
+
+# ── GPU Process Panel (used inside GPUTuningTab) ───────────────────────────────
+
+class GpuProcessPanel(QWidget):
+    """Compact table of processes currently using the GPU."""
+    _COLS = ("Process", "PID", "VRAM")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
+
+        sec = QLabel("GPU PROCESSES"); sec.setFont(QFont("", 9, _bold()))
+        sec.setStyleSheet(f"color:{C_MUTED.name()};letter-spacing:2px;")
+        lay.addWidget(sec)
+
+        self._table = QTableWidget(0, 3, self)
+        self._table.setHorizontalHeaderLabels(self._COLS)
+        self._table.horizontalHeader().setSectionResizeMode(0, _HRM.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, _HRM.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(2, _HRM.ResizeToContents)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setEditTriggers(_ET.NoEditTriggers)
+        self._table.setSelectionBehavior(_SEL.SelectRows)
+        self._table.setSelectionMode(_SELM.SingleSelection)
+        self._table.setAlternatingRowColors(True)
+        self._table.setStyleSheet(f"""
+            QTableWidget {{background:{C_CARD.name()};color:{C_TEXT.name()};
+                gridline-color:{C_BORDER.name()};border:none;font-size:11px;}}
+            QHeaderView::section {{background:{C_PANEL.name()};color:{C_MUTED.name()};
+                border:none;padding:4px 8px;font-size:10px;letter-spacing:1px;}}
+            QTableWidget::item {{padding:4px 8px;}}
+            QTableWidget::item:alternate {{background:{C_BG.name()};}}
+        """)
+        self._table.setMinimumHeight(80)
+        self._table.setMaximumHeight(220)
+        lay.addWidget(self._table)
+
+        self._none_lbl = QLabel("No GPU processes")
+        self._none_lbl.setStyleSheet(f"color:{C_MUTED.name()};font-size:11px;")
+        self._none_lbl.hide()
+        lay.addWidget(self._none_lbl)
+
+    def update_procs(self, procs: list):
+        if not procs:
+            self._table.setRowCount(0)
+            self._table.hide(); self._none_lbl.show(); return
+        self._none_lbl.hide(); self._table.show()
+        self._table.setRowCount(len(procs))
+        for r, p in enumerate(procs):
+            self._table.setItem(r, 0, QTableWidgetItem(p["name"]))
+            self._table.setItem(r, 1, QTableWidgetItem(str(p["pid"])))
+            vram = f"{p['vram_mb']} MB" if p["vram_mb"] else "< 1 MB"
+            item = QTableWidgetItem(vram)
+            item.setForeground(C_GPU if p["vram_mb"] > 100 else C_MUTED)
+            self._table.setItem(r, 2, item)
+        self._table.resizeRowsToContents()
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1988,11 +2236,13 @@ class MainWindow(QMainWindow):
         self._cpu_tab        = CpuTab()
         self._gpu_tuning_tab = GPUTuningTab()
         self._storage_tab    = StorageTab()
+        self._network_tab    = NetworkTab()
         self._task_mgr_tab   = TaskManagerTab()
         tabs.addTab(self._overview_tab,   "Overview")
         tabs.addTab(self._cpu_tab,        "CPU")
         tabs.addTab(self._gpu_tuning_tab, "GPU Tuning")
         tabs.addTab(self._storage_tab,    "Storage")
+        tabs.addTab(self._network_tab,    "Network")
         tabs.addTab(self._task_mgr_tab,   "Processes")
         root.addWidget(tabs, 1)
 
