@@ -104,7 +104,35 @@ C_CRIT   = QColor("#ff5252")
 C_OC     = QColor("#a78bfa")   # purple accent for OC features
 
 # ── App icon ──────────────────────────────────────────────────────────────────
-def _draw_icon(size: int) -> "QPixmap":
+class AppIcon:
+    """Generates and installs the NovaMon application icon."""
+
+    @staticmethod
+    def draw(size: int) -> "QPixmap":
+        return _draw_icon_impl(size)
+
+    @staticmethod
+    def make() -> "QIcon":
+        icon = QIcon()
+        for sz in (16, 24, 32, 48, 64, 128, 256):
+            icon.addPixmap(AppIcon.draw(sz))
+        return icon
+
+    @staticmethod
+    def install():
+        """Write PNGs into ~/.local/share/icons/hicolor so the DE picks them up."""
+        try:
+            base = Path.home() / ".local" / "share" / "icons" / "hicolor"
+            for sz in (16, 24, 32, 48, 64, 128, 256):
+                dest = base / f"{sz}x{sz}" / "apps"
+                dest.mkdir(parents=True, exist_ok=True)
+                AppIcon.draw(sz).save(str(dest / "novamon.png"))
+        except Exception:
+            pass
+
+
+def _draw_icon_impl(size: int) -> "QPixmap":
+    """Pixel-level icon painter — called by AppIcon.draw()."""
     pm = QPixmap(size, size)
     pm.fill(QColor(0, 0, 0, 0))
     p = QPainter(pm); p.setRenderHint(_RH.Antialiasing)
@@ -182,23 +210,10 @@ def _draw_icon(size: int) -> "QPixmap":
     return pm
 
 
-def _make_app_icon() -> "QIcon":
-    icon = QIcon()
-    for sz in (16, 24, 32, 48, 64, 128, 256):
-        icon.addPixmap(_draw_icon(sz))
-    return icon
-
-
-def _install_icon():
-    """Write PNG files into ~/.local/share/icons/hicolor so the DE picks them up."""
-    try:
-        base = Path.home() / ".local" / "share" / "icons" / "hicolor"
-        for sz in (16, 24, 32, 48, 64, 128, 256):
-            dest = base / f"{sz}x{sz}" / "apps"
-            dest.mkdir(parents=True, exist_ok=True)
-            _draw_icon(sz).save(str(dest / "novamon.png"))
-    except Exception:
-        pass   # non-fatal — window icon still works
+# backward-compat aliases used by install.sh and main()
+_draw_icon    = AppIcon.draw
+_make_app_icon = AppIcon.make
+_install_icon  = AppIcon.install
 
 
 # ── Tiny utilities ────────────────────────────────────────────────────────────
@@ -220,335 +235,377 @@ def _gpu_temp_color(t):
     if t < 80: return QColor(C_WARN)
     return QColor(C_CRIT)
 
-# ── Sensor reads ──────────────────────────────────────────────────────────────
-def _cpu_temp() -> float:
-    try:
-        temps = psutil.sensors_temperatures()
-        for name in ("coretemp","k10temp","zenpower","cpu_thermal","acpitz","nct6775","it8"):
-            if name not in temps: continue
-            entries = temps[name]
-            for e in entries:
-                if any(k in e.label for k in ("Package","Tctl","CPU Temp","Core 0")):
-                    return e.current
-            if entries: return entries[0].current
-        for entries in temps.values():
-            if entries: return entries[0].current
-    except: pass
-    for p in Path("/sys/class/hwmon").glob("hwmon*/temp1_input"):
-        try: return int(p.read_text()) / 1000.0
-        except: pass
-    return 0.0
-
-def _gpu_temp() -> float:
-    if NVIDIA and _nvh:
-        try: return float(pynvml.nvmlDeviceGetTemperature(_nvh, pynvml.NVML_TEMPERATURE_GPU))
-        except: pass
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi","--query-gpu=temperature.gpu","--format=csv,noheader,nounits"],
-            timeout=2).decode().strip()
-        return float(out.split("\n")[0])
-    except: pass
-    return 0.0
-
-def _gpu_info() -> dict:
-    d = dict(name="", util=0, mem_used=0, mem_total=0, power=0.0, fan=0, clock=0, mem_clock=0)
-    if not NVIDIA or not _nvh: return d
-    try:
-        raw = pynvml.nvmlDeviceGetName(_nvh)
-        d["name"] = raw.decode() if isinstance(raw, bytes) else raw
-        ur = pynvml.nvmlDeviceGetUtilizationRates(_nvh)
-        d["util"] = ur.gpu
-        mem = pynvml.nvmlDeviceGetMemoryInfo(_nvh)
-        d["mem_used"]  = mem.used  // 1024**2
-        d["mem_total"] = mem.total // 1024**2
-    except: pass
-    try: d["power"] = pynvml.nvmlDeviceGetPowerUsage(_nvh) / 1000.0
-    except: pass
-    try: d["fan"] = pynvml.nvmlDeviceGetFanSpeed(_nvh)
-    except: pass
-    try:
-        d["clock"]     = pynvml.nvmlDeviceGetClockInfo(_nvh, pynvml.NVML_CLOCK_GRAPHICS)
-        d["mem_clock"] = pynvml.nvmlDeviceGetClockInfo(_nvh, pynvml.NVML_CLOCK_MEM)
-    except: pass
-    return d
-
-def _cpu_governor() -> str:
-    try: return Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read_text().strip()
-    except: return "unknown"
-
-def _available_governors() -> list:
-    try: return Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors").read_text().split()
-    except: return []
-
-def _set_governor(gov: str):
-    for p in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor"):
-        try: subprocess.run(["sudo","tee",str(p)], input=gov.encode(), capture_output=True, timeout=3)
-        except: pass
-
-# ── GPU control ───────────────────────────────────────────────────────────────
-_ENV = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")}
-
-def _nvset(attr: str, val) -> bool:
-    r = subprocess.run(
-        ["nvidia-settings","--no-load-config","-a",f"{attr}={val}"],
-        capture_output=True, timeout=5, env=_ENV)
-    return r.returncode == 0
-
-def _check_coolbits() -> bool:
-    r = subprocess.run(
-        ["nvidia-settings","--no-load-config","-q","[fan:0]/GPUTargetFanSpeed"],
-        capture_output=True, text=True, timeout=3, env=_ENV)
-    return "Attribute 'GPUTargetFanSpeed'" in r.stdout
-
-def _power_range() -> tuple:
-    if NVIDIA and _nvh:
-        try:
-            lo, hi = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(_nvh)
-            return lo // 1000, hi // 1000
-        except: pass
-    return 50, 350
-
-def _current_power_limit() -> int:
-    if NVIDIA and _nvh:
-        try: return pynvml.nvmlDeviceGetPowerManagementLimit(_nvh) // 1000
-        except: pass
-    return 200
-
-def _set_power_limit(w: int):
-    subprocess.run(["sudo","nvidia-smi",f"--power-limit={w}"],
-                   capture_output=True, timeout=5)
-
-def _set_core_offset(mhz: int):
-    for ps in range(4):
-        _nvset(f"[gpu:0]/GPUGraphicsClockOffset[{ps}]", mhz)
-
-def _set_mem_offset(mhz: int):
-    for ps in range(4):
-        _nvset(f"[gpu:0]/GPUMemoryTransferRateOffset[{ps}]", mhz)
-
-def _set_fan_manual(pct: int):
-    _nvset("[gpu:0]/GPUFanControlState", 1)
-    _nvset("[fan:0]/GPUTargetFanSpeed", pct)
-
-def _set_fan_auto():
-    _nvset("[gpu:0]/GPUFanControlState", 0)
-
-
-# ── Memory / DIMM sensors ────────────────────────────────────────────────────
-def _dimm_temps() -> list:
-    """Return [(label, temp_c)] for spd5118 DIMM sensors."""
-    result = []
-    slot = 1
-    for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
-        try:
-            if (hwmon / "name").read_text().strip() != "spd5118":
-                continue
-            t = int((hwmon / "temp1_input").read_text().strip()) / 1000
-            result.append((f"DIMM {slot}", t))
-            slot += 1
-        except: pass
-    return result
-
-
-# ── Storage sensors ───────────────────────────────────────────────────────────
-def _phys_dev(dev_path: str) -> str:
-    """'/dev/nvme0n1p2' → 'nvme0n1',  '/dev/sda3' → 'sda'."""
-    name = Path(dev_path).name
-    if "nvme" in name:
-        idx = name.rfind("p")
-        if idx > 0 and name[idx + 1:].isdigit():
-            return name[:idx]
-        return name
-    return name.rstrip("0123456789")
-
-def _nvme_info() -> dict:
-    """Returns {nvme_name: {model, temp}} for each NVMe hwmon device."""
-    result = {}
-    for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
-        try:
-            if (hwmon / "name").read_text().strip() != "nvme":
-                continue
-            dev = (hwmon / "device").resolve()
-            nvme_name = dev.name   # e.g. "nvme0"
-            model = ""
-            for mp in (dev / "model", Path(f"/sys/class/nvme/{nvme_name}/model")):
-                if mp.exists():
-                    model = mp.read_text().strip(); break
-            temp = int((hwmon / "temp1_input").read_text().strip()) / 1000
-            result[nvme_name] = {"model": model, "temp": temp}
-        except: pass
-    return result
-
-_io_prev: dict = {}   # dev → (read_bytes, write_bytes, timestamp)
-
-def _disk_rates() -> dict:
-    """Returns {dev: (read_MB_s, write_MB_s)} delta since last call."""
-    global _io_prev
-    now = time.time()
-    rates = {}
-    try:
-        counters = psutil.disk_io_counters(perdisk=True) or {}
-        for dev, c in counters.items():
-            if dev in _io_prev:
-                pr, pw, pt = _io_prev[dev]
-                dt = now - pt
-                if dt > 0:
-                    rates[dev] = ((c.read_bytes - pr) / dt / 1024**2,
-                                  (c.write_bytes - pw) / dt / 1024**2)
-            _io_prev[dev] = (c.read_bytes, c.write_bytes, now)
-    except: pass
-    return rates
-
-def _disk_info() -> list:
-    """Returns list of {phys_dev, model, temp, mounts:[{mountpoint,used_gb,total_gb,pct,fstype}]}."""
-    nvme = _nvme_info()
-    groups: dict = {}
-    for part in psutil.disk_partitions(all=False):
-        try:
-            if not part.mountpoint or part.fstype in ("tmpfs","devtmpfs","squashfs",""):
-                continue
-            usage = psutil.disk_usage(part.mountpoint)
-            phys  = _phys_dev(part.device)
-            if phys not in groups:
-                # Try to get model for non-NVMe drives
-                model = ""
-                for mp in (Path(f"/sys/block/{phys}/device/model"),):
-                    if mp.exists():
-                        model = mp.read_text().strip(); break
-                # NVMe: map nvme0n1 → nvme0
-                import re as _re
-                nvme_key = ""
-                if "nvme" in phys:
-                    m = _re.match(r"(nvme\d+)", phys)
-                    if m: nvme_key = m.group(1)
-                ni = nvme.get(nvme_key, {})
-                groups[phys] = {"phys_dev": phys, "model": ni.get("model", model),
-                                "temp": ni.get("temp", 0), "mounts": []}
-            groups[phys]["mounts"].append({
-                "mountpoint": part.mountpoint,
-                "used_gb":  usage.used  / 1024**3,
-                "total_gb": usage.total / 1024**3,
-                "pct":      usage.percent,
-                "fstype":   part.fstype,
-            })
-        except: pass
-    return list(groups.values())
-
-
-# ── Network sensors ───────────────────────────────────────────────────────────
+import re as _re
 import socket as _socket
 
-_net_prev: dict = {}   # iface → (snetio, timestamp)
+# ═════════════════════════════════════════════════════════════════════════════
+# SENSOR HUB  — all hardware reads, no writes
+# ═════════════════════════════════════════════════════════════════════════════
 
-def _net_rates() -> dict:
-    """Returns {iface: (upload_MB_s, download_MB_s)} since last call."""
-    global _net_prev
-    now = time.time()
-    try:
-        stats = psutil.net_io_counters(pernic=True)
-    except Exception:
-        return {}
-    rates = {}
-    for iface, s in stats.items():
-        if iface in _net_prev:
-            prev_s, prev_t = _net_prev[iface]
-            dt = now - prev_t
-            if dt > 0:
-                up = (s.bytes_sent - prev_s.bytes_sent) / dt / 1_048_576
-                dn = (s.bytes_recv - prev_s.bytes_recv) / dt / 1_048_576
-                rates[iface] = (max(0.0, up), max(0.0, dn))
-        _net_prev[iface] = (s, now)
-    return rates
+class SensorHub:
+    """Reads temperatures, usage, disk, network, and GPU process data."""
 
-def _net_ifaces() -> list:
-    """Return list of active interface dicts (skip loopback + never-used)."""
-    try:
-        addrs = psutil.net_if_addrs()
-        stats = psutil.net_io_counters(pernic=True)
-    except Exception:
-        return []
-    result = []
-    for iface, s in stats.items():
-        if iface == "lo":
-            continue
-        if s.bytes_sent == 0 and s.bytes_recv == 0:
-            continue
-        ip = ""
-        for a in addrs.get(iface, []):
-            if a.family == _socket.AF_INET:
-                ip = a.address; break
-        result.append({
-            "iface":       iface,
-            "ip":          ip,
-            "bytes_sent":  s.bytes_sent,
-            "bytes_recv":  s.bytes_recv,
-        })
-    return result
+    _io_prev:  dict = {}   # dev   → (read_bytes, write_bytes, timestamp)
+    _net_prev: dict = {}   # iface → (snetio, timestamp)
 
-
-# ── GPU process list ───────────────────────────────────────────────────────────
-def _gpu_processes() -> list:
-    """Return [{pid, name, vram_mb}] sorted by VRAM descending."""
-    if not NVIDIA or not _nvh:
-        return []
-    procs, seen = [], set()
-    try:
-        for fn in (pynvml.nvmlDeviceGetComputeRunningProcesses,
-                   pynvml.nvmlDeviceGetGraphicsRunningProcesses):
-            try:
-                for p in fn(_nvh):
-                    if p.pid not in seen:
-                        seen.add(p.pid)
-                        procs.append(p)
-            except Exception:
-                pass
-    except Exception:
-        return []
-    result = []
-    for p in procs:
+    @staticmethod
+    def cpu_temp() -> float:
         try:
-            name = psutil.Process(p.pid).name()
-        except Exception:
+            temps = psutil.sensors_temperatures()
+            for name in ("coretemp","k10temp","zenpower","cpu_thermal","acpitz","nct6775","it8"):
+                if name not in temps: continue
+                entries = temps[name]
+                for e in entries:
+                    if any(k in e.label for k in ("Package","Tctl","CPU Temp","Core 0")):
+                        return e.current
+                if entries: return entries[0].current
+            for entries in temps.values():
+                if entries: return entries[0].current
+        except: pass
+        for p in Path("/sys/class/hwmon").glob("hwmon*/temp1_input"):
+            try: return int(p.read_text()) / 1000.0
+            except: pass
+        return 0.0
+
+    @staticmethod
+    def gpu_temp() -> float:
+        if NVIDIA and _nvh:
+            try: return float(pynvml.nvmlDeviceGetTemperature(_nvh, pynvml.NVML_TEMPERATURE_GPU))
+            except: pass
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi","--query-gpu=temperature.gpu","--format=csv,noheader,nounits"],
+                timeout=2).decode().strip()
+            return float(out.split("\n")[0])
+        except: pass
+        return 0.0
+
+    @staticmethod
+    def gpu_info() -> dict:
+        d = dict(name="", util=0, mem_used=0, mem_total=0, power=0.0, fan=0, clock=0, mem_clock=0)
+        if not NVIDIA or not _nvh: return d
+        try:
+            raw = pynvml.nvmlDeviceGetName(_nvh)
+            d["name"] = raw.decode() if isinstance(raw, bytes) else raw
+            ur  = pynvml.nvmlDeviceGetUtilizationRates(_nvh)
+            d["util"] = ur.gpu
+            mem = pynvml.nvmlDeviceGetMemoryInfo(_nvh)
+            d["mem_used"]  = mem.used  // 1024**2
+            d["mem_total"] = mem.total // 1024**2
+        except: pass
+        try: d["power"] = pynvml.nvmlDeviceGetPowerUsage(_nvh) / 1000.0
+        except: pass
+        try: d["fan"] = pynvml.nvmlDeviceGetFanSpeed(_nvh)
+        except: pass
+        try:
+            d["clock"]     = pynvml.nvmlDeviceGetClockInfo(_nvh, pynvml.NVML_CLOCK_GRAPHICS)
+            d["mem_clock"] = pynvml.nvmlDeviceGetClockInfo(_nvh, pynvml.NVML_CLOCK_MEM)
+        except: pass
+        return d
+
+    @staticmethod
+    def cpu_governor() -> str:
+        try: return Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").read_text().strip()
+        except: return "unknown"
+
+    @staticmethod
+    def dimm_temps() -> list:
+        result = []; slot = 1
+        for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
             try:
-                name = Path(f"/proc/{p.pid}/comm").read_text().strip()
-            except Exception:
-                name = f"pid {p.pid}"
-        vram = getattr(p, "usedGpuMemory", 0) or 0
-        result.append({"pid": p.pid, "name": name, "vram_mb": vram // 1_048_576})
-    return sorted(result, key=lambda x: x["vram_mb"], reverse=True)
+                if (hwmon / "name").read_text().strip() != "spd5118": continue
+                t = int((hwmon / "temp1_input").read_text().strip()) / 1000
+                result.append((f"DIMM {slot}", t)); slot += 1
+            except: pass
+        return result
+
+    @staticmethod
+    def phys_dev(dev_path: str) -> str:
+        """'/dev/nvme0n1p2' → 'nvme0n1',  '/dev/sda3' → 'sda'."""
+        name = Path(dev_path).name
+        if "nvme" in name:
+            idx = name.rfind("p")
+            if idx > 0 and name[idx + 1:].isdigit(): return name[:idx]
+            return name
+        return name.rstrip("0123456789")
+
+    @staticmethod
+    def nvme_info() -> dict:
+        result = {}
+        for hwmon in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+            try:
+                if (hwmon / "name").read_text().strip() != "nvme": continue
+                dev = (hwmon / "device").resolve(); nvme_name = dev.name
+                model = ""
+                for mp in (dev / "model", Path(f"/sys/class/nvme/{nvme_name}/model")):
+                    if mp.exists(): model = mp.read_text().strip(); break
+                temp = int((hwmon / "temp1_input").read_text().strip()) / 1000
+                result[nvme_name] = {"model": model, "temp": temp}
+            except: pass
+        return result
+
+    @classmethod
+    def disk_rates(cls) -> dict:
+        now = time.time(); rates = {}
+        try:
+            counters = psutil.disk_io_counters(perdisk=True) or {}
+            for dev, c in counters.items():
+                if dev in cls._io_prev:
+                    pr, pw, pt = cls._io_prev[dev]; dt = now - pt
+                    if dt > 0:
+                        rates[dev] = ((c.read_bytes - pr) / dt / 1024**2,
+                                      (c.write_bytes - pw) / dt / 1024**2)
+                cls._io_prev[dev] = (c.read_bytes, c.write_bytes, now)
+        except: pass
+        return rates
+
+    @classmethod
+    def disk_info(cls) -> list:
+        nvme = cls.nvme_info(); groups: dict = {}
+        for part in psutil.disk_partitions(all=False):
+            try:
+                if not part.mountpoint or part.fstype in ("tmpfs","devtmpfs","squashfs",""): continue
+                usage = psutil.disk_usage(part.mountpoint)
+                phys  = cls.phys_dev(part.device)
+                if phys not in groups:
+                    model = ""
+                    mp = Path(f"/sys/block/{phys}/device/model")
+                    if mp.exists(): model = mp.read_text().strip()
+                    nvme_key = ""
+                    if "nvme" in phys:
+                        m = _re.match(r"(nvme\d+)", phys)
+                        if m: nvme_key = m.group(1)
+                    ni = nvme.get(nvme_key, {})
+                    groups[phys] = {"phys_dev": phys, "model": ni.get("model", model),
+                                    "temp": ni.get("temp", 0), "mounts": []}
+                groups[phys]["mounts"].append({
+                    "mountpoint": part.mountpoint,
+                    "used_gb":  usage.used  / 1024**3,
+                    "total_gb": usage.total / 1024**3,
+                    "pct":      usage.percent,
+                    "fstype":   part.fstype,
+                })
+            except: pass
+        return list(groups.values())
+
+    @classmethod
+    def net_rates(cls) -> dict:
+        now = time.time()
+        try: stats = psutil.net_io_counters(pernic=True)
+        except: return {}
+        rates = {}
+        for iface, s in stats.items():
+            if iface in cls._net_prev:
+                prev_s, prev_t = cls._net_prev[iface]; dt = now - prev_t
+                if dt > 0:
+                    up = (s.bytes_sent - prev_s.bytes_sent) / dt / 1_048_576
+                    dn = (s.bytes_recv - prev_s.bytes_recv) / dt / 1_048_576
+                    rates[iface] = (max(0.0, up), max(0.0, dn))
+            cls._net_prev[iface] = (s, now)
+        return rates
+
+    @staticmethod
+    def net_ifaces() -> list:
+        try:
+            addrs = psutil.net_if_addrs()
+            stats = psutil.net_io_counters(pernic=True)
+        except: return []
+        result = []
+        for iface, s in stats.items():
+            if iface == "lo": continue
+            if s.bytes_sent == 0 and s.bytes_recv == 0: continue
+            ip = ""
+            for a in addrs.get(iface, []):
+                if a.family == _socket.AF_INET: ip = a.address; break
+            result.append({"iface": iface, "ip": ip,
+                           "bytes_sent": s.bytes_sent, "bytes_recv": s.bytes_recv})
+        return result
+
+    @staticmethod
+    def gpu_processes() -> list:
+        if not NVIDIA or not _nvh: return []
+        procs, seen = [], set()
+        try:
+            for fn in (pynvml.nvmlDeviceGetComputeRunningProcesses,
+                       pynvml.nvmlDeviceGetGraphicsRunningProcesses):
+                try:
+                    for p in fn(_nvh):
+                        if p.pid not in seen: seen.add(p.pid); procs.append(p)
+                except: pass
+        except: return []
+        result = []
+        for p in procs:
+            try:   name = psutil.Process(p.pid).name()
+            except:
+                try:   name = Path(f"/proc/{p.pid}/comm").read_text().strip()
+                except: name = f"pid {p.pid}"
+            vram = getattr(p, "usedGpuMemory", 0) or 0
+            result.append({"pid": p.pid, "name": name, "vram_mb": vram // 1_048_576})
+        return sorted(result, key=lambda x: x["vram_mb"], reverse=True)
 
 
-# ── GPU profile persistence ───────────────────────────────────────────────────
-_PROF_DIR  = Path.home() / ".config" / "thermalwatch"
-_PROF_FILE = _PROF_DIR / "gpu_profiles.json"
+# ═════════════════════════════════════════════════════════════════════════════
+# CPU CONTROLLER  — governor reads and writes
+# ═════════════════════════════════════════════════════════════════════════════
 
-def _save_gpu_profile(slot: int, data: dict):
-    _PROF_DIR.mkdir(parents=True, exist_ok=True)
-    try:    all_p = json.loads(_PROF_FILE.read_text()) if _PROF_FILE.exists() else {}
-    except: all_p = {}
-    all_p[str(slot)] = data
-    _PROF_FILE.write_text(json.dumps(all_p, indent=2))
+class CpuController:
+    """Reads and sets the CPU frequency scaling governor."""
 
-def _load_gpu_profiles() -> dict:
-    try: return json.loads(_PROF_FILE.read_text()) if _PROF_FILE.exists() else {}
-    except: return {}
+    @staticmethod
+    def available_governors() -> list:
+        try: return Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors").read_text().split()
+        except: return []
 
-# ── Process kill helper ───────────────────────────────────────────────────────
-def _kill_proc(pid: int, force: bool = False) -> tuple:
-    sig     = signal.SIGKILL if force else signal.SIGTERM
-    sig_str = "-9" if force else "-15"
-    try:
-        os.kill(pid, sig)
-        return True, "Signal sent"
-    except ProcessLookupError:
-        return False, "Process not found"
-    except PermissionError:
-        r = subprocess.run(["sudo", "kill", sig_str, str(pid)],
-                           capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            return True, "Killed (elevated)"
-        return False, (r.stderr.strip() or "sudo kill failed")
+    @staticmethod
+    def set_governor(gov: str):
+        for p in Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor"):
+            try: subprocess.run(["sudo","tee",str(p)], input=gov.encode(), capture_output=True, timeout=3)
+            except: pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# GPU CONTROLLER  — NVIDIA settings, power limit, OC, fan
+# ═════════════════════════════════════════════════════════════════════════════
+
+class GpuController:
+    """Applies NVIDIA GPU settings via nvidia-settings and nvidia-smi."""
+
+    _ENV = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":0")}
+
+    @classmethod
+    def nvset(cls, attr: str, val) -> bool:
+        r = subprocess.run(
+            ["nvidia-settings","--no-load-config","-a",f"{attr}={val}"],
+            capture_output=True, timeout=5, env=cls._ENV)
+        return r.returncode == 0
+
+    @classmethod
+    def check_coolbits(cls) -> bool:
+        r = subprocess.run(
+            ["nvidia-settings","--no-load-config","-q","[fan:0]/GPUTargetFanSpeed"],
+            capture_output=True, text=True, timeout=3, env=cls._ENV)
+        return "Attribute 'GPUTargetFanSpeed'" in r.stdout
+
+    @staticmethod
+    def power_range() -> tuple:
+        if NVIDIA and _nvh:
+            try:
+                lo, hi = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(_nvh)
+                return lo // 1000, hi // 1000
+            except: pass
+        return 50, 350
+
+    @staticmethod
+    def current_power_limit() -> int:
+        if NVIDIA and _nvh:
+            try: return pynvml.nvmlDeviceGetPowerManagementLimit(_nvh) // 1000
+            except: pass
+        return 200
+
+    @staticmethod
+    def set_power_limit(w: int):
+        subprocess.run(["sudo","nvidia-smi",f"--power-limit={w}"],
+                       capture_output=True, timeout=5)
+
+    @classmethod
+    def set_core_offset(cls, mhz: int):
+        for ps in range(4):
+            cls.nvset(f"[gpu:0]/GPUGraphicsClockOffset[{ps}]", mhz)
+
+    @classmethod
+    def set_mem_offset(cls, mhz: int):
+        for ps in range(4):
+            cls.nvset(f"[gpu:0]/GPUMemoryTransferRateOffset[{ps}]", mhz)
+
+    @classmethod
+    def set_fan_manual(cls, pct: int):
+        cls.nvset("[gpu:0]/GPUFanControlState", 1)
+        cls.nvset("[fan:0]/GPUTargetFanSpeed", pct)
+
+    @classmethod
+    def set_fan_auto(cls):
+        cls.nvset("[gpu:0]/GPUFanControlState", 0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROFILE STORE  — save / load GPU tuning profiles
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ProfileStore:
+    """Persists GPU tuning profiles to ~/.config/thermalwatch/gpu_profiles.json."""
+
+    _dir  = Path.home() / ".config" / "thermalwatch"
+    _file = _dir / "gpu_profiles.json"
+
+    @classmethod
+    def save(cls, slot: int, data: dict):
+        cls._dir.mkdir(parents=True, exist_ok=True)
+        try:    all_p = json.loads(cls._file.read_text()) if cls._file.exists() else {}
+        except: all_p = {}
+        all_p[str(slot)] = data
+        cls._file.write_text(json.dumps(all_p, indent=2))
+
+    @classmethod
+    def load(cls) -> dict:
+        try: return json.loads(cls._file.read_text()) if cls._file.exists() else {}
+        except: return {}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PROCESS MANAGER  — signal processes, escalate to sudo on permission error
+# ═════════════════════════════════════════════════════════════════════════════
+
+class ProcessManager:
+    """Sends signals to processes, escalating to sudo on PermissionError."""
+
+    @staticmethod
+    def kill(pid: int, force: bool = False) -> tuple:
+        sig     = signal.SIGKILL if force else signal.SIGTERM
+        sig_str = "-9" if force else "-15"
+        try:
+            os.kill(pid, sig)
+            return True, "Signal sent"
+        except ProcessLookupError:
+            return False, "Process not found"
+        except PermissionError:
+            r = subprocess.run(["sudo","kill",sig_str,str(pid)],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0: return True, "Killed (elevated)"
+            return False, (r.stderr.strip() or "sudo kill failed")
+
+
+# ── Backward-compatible aliases (call sites throughout this file unchanged) ───
+_cpu_temp            = SensorHub.cpu_temp
+_gpu_temp            = SensorHub.gpu_temp
+_gpu_info            = SensorHub.gpu_info
+_cpu_governor        = SensorHub.cpu_governor
+_dimm_temps          = SensorHub.dimm_temps
+_phys_dev            = SensorHub.phys_dev
+_nvme_info           = SensorHub.nvme_info
+_disk_rates          = SensorHub.disk_rates
+_disk_info           = SensorHub.disk_info
+_net_rates           = SensorHub.net_rates
+_net_ifaces          = SensorHub.net_ifaces
+_gpu_processes       = SensorHub.gpu_processes
+_available_governors = CpuController.available_governors
+_set_governor        = CpuController.set_governor
+_nvset               = GpuController.nvset
+_check_coolbits      = GpuController.check_coolbits
+_power_range         = GpuController.power_range
+_current_power_limit = GpuController.current_power_limit
+_set_power_limit     = GpuController.set_power_limit
+_set_core_offset     = GpuController.set_core_offset
+_set_mem_offset      = GpuController.set_mem_offset
+_set_fan_manual      = GpuController.set_fan_manual
+_set_fan_auto        = GpuController.set_fan_auto
+_save_gpu_profile    = ProfileStore.save
+_load_gpu_profiles   = ProfileStore.load
+_kill_proc           = ProcessManager.kill
+# state aliases — same dict objects, so mutations are visible on both sides
+_io_prev             = SensorHub._io_prev
+_net_prev            = SensorHub._net_prev
+_PROF_DIR            = ProfileStore._dir
+_PROF_FILE           = ProfileStore._file
 
 
 # ── CPU performance profiles ──────────────────────────────────────────────────
