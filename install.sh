@@ -3,10 +3,21 @@
 # Run with: bash install.sh  (will prompt for sudo password once)
 set -e
 
-echo "NovaMon installer — sudo access is needed for the sudoers rule."
+echo "NovaMon installer — sudo access is needed to install packages and set up the sudoers rule."
 sudo -v
 
+# System packages
+echo "Installing system dependencies…"
+sudo apt-get update -qq
+sudo apt-get install -y -qq \
+    python3 python3-pip \
+    lm-sensors \
+    nvidia-settings 2>/dev/null || true
+
+# Python packages
+echo "Installing Python dependencies…"
 pip install -r "$(dirname "$0")/requirements.txt" --break-system-packages 2>/dev/null \
+  || pip3 install -r "$(dirname "$0")/requirements.txt" --break-system-packages 2>/dev/null \
   || pip install -r "$(dirname "$0")/requirements.txt"
 
 # sudo rule so the app can switch CPU governor and NVIDIA power limit without a password prompt
