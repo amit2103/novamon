@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # NovaMon — install dependencies and create launcher
+# Run with: bash install.sh  (will prompt for sudo password once)
 set -e
+
+echo "NovaMon installer — sudo access is needed for the sudoers rule."
+sudo -v
 
 pip install -r "$(dirname "$0")/requirements.txt" --break-system-packages 2>/dev/null \
   || pip install -r "$(dirname "$0")/requirements.txt"
