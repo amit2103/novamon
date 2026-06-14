@@ -1255,13 +1255,10 @@ class OverviewTab(QWidget):
         self._gpu_bar   = UsageBar(C_GPU)
         self._gpu_pct   = QLabel("Utilization: 0%"); self._gpu_pct.setStyleSheet(f"color:{C_MUTED.name()};font-size:10px;")
         self._gpu_spark = Sparkline("GPU temperature history", C_GPU)
-        self._gpu_util  = InfoRow("GPU Utilization")
-        self._gpu_mem   = InfoRow("VRAM Used")
+        self._gpu_util  = InfoRow("Utilization")
         self._gpu_power = InfoRow("Power Draw")
-        self._gpu_fan   = InfoRow("Fan Speed")
-        self._gpu_clock = InfoRow("Core / Mem Clock")
         for w in (lb2, self._gpu_gauge, self._gpu_bar, self._gpu_pct, self._gpu_spark,
-                  self._gpu_util, self._gpu_mem, self._gpu_power, self._gpu_fan, self._gpu_clock):
+                  self._gpu_util, self._gpu_power):
             gl.addWidget(w)
 
         row.addWidget(cpu_f); row.addWidget(gpu_f)
@@ -1298,11 +1295,7 @@ class OverviewTab(QWidget):
         self._cpu_freq.set(f"{d['cpu_mhz']:.0f} MHz"); self._cpu_gov.set(gov)
         if gi["name"]: self._gpu_name.setText(gi["name"])
         self._gpu_util.set(f"{gi['util']}%")
-        mp = (gi['mem_used'] / gi['mem_total'] * 100) if gi['mem_total'] else 0
-        self._gpu_mem.set(f"{gi['mem_used']} / {gi['mem_total']} MB  ({mp:.0f}%)")
         self._gpu_power.set(f"{gi['power']:.1f} W")
-        self._gpu_fan.set(f"{gi['fan']}%" if gi['fan'] else "N/A")
-        self._gpu_clock.set(f"{gi['clock']} / {gi['mem_clock']} MHz" if gi['clock'] else "N/A")
         # RAM
         vm = d.get("ram"); sm = d.get("swap")
         if vm:
