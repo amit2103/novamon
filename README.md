@@ -1,7 +1,43 @@
-# ThermalWatch
+# NovaMon
 
-A unified CPU and GPU temperature monitor and performance tuner for Linux desktops, built with PyQt6.
-Designed after the aesthetic of Tuxedo Control Center and the feature set of MSI Afterburner.
+A unified Linux system monitor and GPU performance tuner built with PyQt6. Dark-themed, real-time, and designed to give you everything at a glance — temperatures, per-core CPU load, GPU tuning, storage, network, and a full task manager — all in one window.
+
+---
+
+## What to expect
+
+When you launch NovaMon you get a sidebar that always shows your CPU governor and a one-click performance profile switcher (Silent / Balanced / Performance), plus six tabs:
+
+| Tab | What you see |
+|---|---|
+| **Overview** | Animated temperature gauges for CPU + GPU, 90-second history sparklines, RAM usage with DIMM temperatures |
+| **CPU** | Per-core load heatmap for all logical cores, average frequency, min/max load |
+| **GPU Tuning** | Power limit, clock offset sliders, live sparklines for core/mem clock, power draw, fan speed, and an interactive fan curve editor |
+| **Storage** | Per-drive card showing model, NVMe temperature, read/write rates, and per-partition fill bars |
+| **Network** | Per-interface upload/download rates with sparklines and total bytes transferred |
+| **Processes** | Sortable, searchable task manager with one-click kill / force-kill |
+
+---
+
+## Screenshots
+
+### Overview
+![Overview](screenshots/1_overview.png)
+
+### CPU — Per-core Load
+![CPU](screenshots/2_cpu.png)
+
+### GPU Tuning
+![GPU Tuning](screenshots/3_gpu.png)
+
+### Storage
+![Storage](screenshots/4_storage.png)
+
+### Network
+![Network](screenshots/5_network.png)
+
+### Processes
+![Processes](screenshots/6_processes.png)
 
 ---
 
