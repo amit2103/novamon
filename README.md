@@ -308,3 +308,13 @@ Or, if Wayland is the default session and the app does not open:
 ```bash
 QT_QPA_PLATFORM=xcb python3 thermalwatch.py
 ```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE) for the full text.
+
+## Disclaimer
+
+This software is provided **as-is**, without warranty of any kind. The author is not responsible for any damage to hardware, instability, data loss, or any other consequence arising from its use. Features that write to system files (CPU governor, NVIDIA power limit, fan control) interact directly with kernel interfaces and hardware drivers — use them at your own risk. Always ensure your system has adequate cooling before applying performance or overclocking settings.
