@@ -659,16 +659,23 @@ class Gauge(QWidget):
         self._anim   = 0.0
         self.setMinimumSize(180, 180)
         self.setSizePolicy(_SP.Expanding, _SP.Expanding)
-        QTimer(self, interval=16, timeout=self._step).start()
+        self._timer = QTimer(self, interval=50)
+        self._timer.timeout.connect(self._step)
 
     def set_value(self, v: float, color: QColor = None):
         self._target = _clamp(v, 0, 100)
         if color: self._color = color
+        if not self._timer.isActive():
+            self._timer.start()
 
     def _step(self):
         d = self._target - self._anim
         if abs(d) > 0.15:
             self._anim += d * 0.14
+            self.update()
+        else:
+            self._anim = self._target
+            self._timer.stop()
             self.update()
 
     def paintEvent(self, _):
@@ -1777,10 +1784,20 @@ class CpuDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class _ProcWorker(QThread):
+    result = pyqtSignal(list)
+    def __init__(self, cache: "ProcCache", parent=None):
+        super().__init__(parent)
+        self._cache = cache
+    def run(self):
+        self.result.emit(self._cache.snapshot())
+
+
 class TaskManagerTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._cache = ProcCache()
+        self._cache  = ProcCache()
+        self._worker = None
         self._build()
         self._timer = QTimer(self, interval=2000)
         self._timer.timeout.connect(self._refresh)
@@ -1863,7 +1880,13 @@ class TaskManagerTab(QWidget):
         lay.addWidget(self._status)
 
     def _refresh(self):
-        rows = self._cache.snapshot()
+        if self._worker and self._worker.isRunning():
+            return
+        self._worker = _ProcWorker(self._cache, self)
+        self._worker.result.connect(self._on_rows)
+        self._worker.start()
+
+    def _on_rows(self, rows: list):
         self._model.update_rows(rows)
         total_cpu = sum(r["cpu"] for r in rows)
         vm  = psutil.virtual_memory()
@@ -2294,6 +2317,7 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._storage_tab,    "Storage")
         tabs.addTab(self._network_tab,    "Network")
         tabs.addTab(self._task_mgr_tab,   "Processes")
+        self._tabs = tabs
         root.addWidget(tabs, 1)
 
     def _build_sidebar(self) -> QWidget:
@@ -2329,6 +2353,11 @@ class MainWindow(QMainWindow):
         return w
 
     def _start(self):
+        # Snapshot original settings so profiles can be undone on quit
+        self._orig_governor   = SensorHub.cpu_governor()
+        self._orig_power_limit = GpuController.current_power_limit() if NVIDIA and _nvh else None
+        self._profile_applied = False
+
         self._col = Collector(); self._col.tick.connect(self._on_tick); self._col.start()
         self._blink_state = True
         QTimer(self, interval=800, timeout=self._blink).start()
@@ -2351,7 +2380,11 @@ class MainWindow(QMainWindow):
         show_act = QAction("Show / Hide", self)
         show_act.triggered.connect(self._toggle_window)
         quit_act  = QAction("Quit NovaMon", self)
-        quit_act.triggered.connect(QApplication.instance().quit)
+        def _quit():
+            self._restore_original_settings()
+            if hasattr(self, "_col"): self._col.requestInterruption(); self._col.wait(1000)
+            QApplication.instance().quit()
+        quit_act.triggered.connect(_quit)
         menu.addAction(show_act)
         menu.addSeparator()
         menu.addAction(quit_act)
@@ -2379,29 +2412,67 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_tick(self, d: dict):
-        self._overview_tab.on_tick(d)
-        self._cpu_tab.on_tick(d)
-        self._gpu_tuning_tab.on_tick(d)
+        active = self._tabs.currentWidget()
+        for tab in (self._overview_tab, self._cpu_tab, self._gpu_tuning_tab):
+            if tab is active:
+                tab.on_tick(d)
+                break
         self._gov_row.set(d["gov"])
 
     def _on_profile(self, key: str):
-        for k, btn in self._profile_btns.items(): btn.set_active(k == key)
-        self._profile_key = key; pr = PROFILES[key]
+        pr = PROFILES[key]
         gov = pr["gov"]; avail = _available_governors()
         if gov not in avail and avail:
             for fb in ("schedutil","ondemand","powersave","performance"):
                 if fb in avail: gov = fb; break
-        _set_governor(gov)
+
+        pwr_msg = ""
         if NVIDIA and _nvh:
             try:
                 lo, hi = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(_nvh)
-                _set_power_limit(int(lo // 1000 + (hi // 1000 - lo // 1000) * pr["pct"]))
-            except: pass
+                new_pwr = int(lo // 1000 + (hi // 1000 - lo // 1000) * pr["pct"])
+                pwr_msg = f"\n• GPU power limit → {new_pwr} W"
+            except:
+                new_pwr = None
+        else:
+            new_pwr = None
+
+        reply = QMessageBox.question(
+            self,
+            f"Apply {pr['label']} Profile?",
+            f"This will change system settings that persist after NovaMon closes:\n\n"
+            f"• CPU governor → {gov}{pwr_msg}\n\n"
+            f"These will be restored to original values when you quit NovaMon.\n"
+            f"Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        for k, btn in self._profile_btns.items(): btn.set_active(k == key)
+        self._profile_key = key
+        _set_governor(gov)
+        self._profile_applied = True
+        if new_pwr is not None:
+            _set_power_limit(new_pwr)
+
+    def _restore_original_settings(self):
+        if not getattr(self, "_profile_applied", False):
+            return
+        try:
+            if getattr(self, "_orig_governor", None):
+                _set_governor(self._orig_governor)
+            if NVIDIA and _nvh and getattr(self, "_orig_power_limit", None):
+                _set_power_limit(self._orig_power_limit)
+        except Exception:
+            pass
 
     def closeEvent(self, e):
         if hasattr(self, "_tray") and self._tray.isVisible():
             self.hide(); e.ignore()   # minimize to tray; use Quit from tray menu to exit
         else:
+            self._restore_original_settings()
             if hasattr(self, "_col"): self._col.requestInterruption(); self._col.wait(1000)
             super().closeEvent(e)
 
